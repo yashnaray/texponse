@@ -1,0 +1,99 @@
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+from qdrant_client import QdrantClient
+from qdrant_client.http.models import SparseVector
+
+from texponse.integrations.openrouter import OpenRouterClient
+from texponse.rag.retriever import Embedder
+
+logger = logging.getLogger(__name__)
+
+
+class EmbeddingPipeline:
+    def __init__(
+        self,
+        qdrant: QdrantClient,
+        openrouter: OpenRouterClient,
+        collection_name: str,
+    ) -> None:
+        self._qdrant = qdrant
+        self._embedder = Embedder(openrouter)
+        self._collection = collection_name
+        self._chunk_size = 512
+        self._chunk_overlap = 50
+
+    def _build_sparse_vector(self, text: str) -> SparseVector:
+        return Embedder.build_sparse_vector(text)
+
+    async def index_document(
+        self,
+        document_id: str,
+        text: str,
+        source_url: str,
+        category: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> int:
+        chunks = self._chunk_text(text)
+        if not chunks:
+            logger.warning("Document '%s' produced no chunks", document_id)
+            return 0
+
+        embeddings = await self._embedder.embed_texts(chunks)
+
+        points: list[Any] = []
+        for i, (chunk, vector) in enumerate(zip(chunks, embeddings, strict=True)):
+            point_id = f"{document_id}:{i}"
+            sparse = self._build_sparse_vector(chunk)
+            points.append(
+                {
+                    "id": point_id,
+                    "vector": {
+                        "dense": vector,
+                        "text_sparse": {"indices": sparse.indices, "values": sparse.values},
+                    },
+                    "payload": {
+                        "text": chunk,
+                        "source_url": source_url,
+                        "category": category,
+                        "document_id": document_id,
+                        "chunk_index": i,
+                        "last_updated": metadata.get("last_updated", "") if metadata else "",
+                        **(metadata.get("extra", {}) if metadata else {}),
+                    },
+                }
+            )
+
+        self._qdrant.upsert(
+            collection_name=self._collection,
+            points=points,
+            wait=True,
+        )
+        logger.info("Indexed %d chunks for document '%s' in Qdrant", len(points), document_id)
+        return len(points)
+
+    def _chunk_text(self, text: str) -> list[str]:
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        words = text.split()
+        if not words:
+            return []
+
+        chunks: list[str] = []
+        chunk_words: list[str] = []
+
+        for word in words:
+            chunk_words.append(word)
+            if len(chunk_words) >= self._chunk_size:
+                chunks.append(" ".join(chunk_words))
+                overlap = chunk_words[-self._chunk_overlap :] if self._chunk_overlap > 0 else []
+                chunk_words = overlap
+
+        if chunk_words:
+            chunks.append(" ".join(chunk_words))
+
+        return [c.strip() for c in chunks if c.strip()]
+
+    async def sync_from_jobber(self, access_token: str) -> int:
+        return 0

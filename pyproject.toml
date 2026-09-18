@@ -1,0 +1,86 @@
+[project]
+name = "texponse"
+version = "0.1.0"
+description = "AI-driven voice/SMS support agent integrating Aircall, Jobber, Qdrant, and OpenRouter"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+
+dependencies = [
+    "fastapi>=0.111.0",
+    "uvicorn[standard]>=0.30.0",
+    "httpx[http2]>=0.27.0",
+    "sqlmodel>=0.0.18",
+    "asyncpg>=0.29.0",
+    "alembic>=1.13.0",
+    "qdrant-client[fastembed]>=1.10.0",
+    "openai>=1.40.0",
+    "celery>=5.4.0",
+    "redis>=5.0.7",
+    "pydantic-settings>=2.3.0",
+    "pydantic",
+    "slowapi>=0.1.9",
+    "tiktoken>=0.7.0",
+    "opentelemetry-api>=1.25.0",
+    "opentelemetry-sdk>=1.25.0",
+    "opentelemetry-instrumentation-fastapi>=0.46b0",
+    "psutil>=5.9.0",
+    "pyjwt>=2.9.0",
+    "numpy<2.0; python_version<'3.12'",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.6.0",
+    "mypy>=1.11.0",
+    "black>=24.4.0",
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+    "pytest-httpx>=0.30.0",
+    "respx>=0.21.0",
+    "testcontainers>=4.8.0",
+]
+
+[project.scripts]
+texponse = "texponse.main:cli"
+texponse-index = "texponse.tasks.indexer:cli"
+texponse-worker = "texponse.tasks.worker:cli"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/texponse"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.12"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+strict_equality = true
+
+[[tool.mypy.overrides]]
+module = "qdrant_client.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "celery.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "numpy.*"
+ignore_errors = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
