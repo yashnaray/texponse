@@ -16,7 +16,7 @@ services:
       context: .
       dockerfile: Dockerfile
       target: runtime
-    command: uv run celery -A texponse.tasks.worker worker --loglevel=INFO --concurrency=4 --pool=solo
+    command: uv run celery -A texponse.tasks.background worker --loglevel=INFO --concurrency=4 --pool=solo
     env_file: .env
     depends_on: [postgres, qdrant, redis]
     volumes: ["./src:/app/src"]
@@ -26,7 +26,7 @@ services:
       context: .
       dockerfile: Dockerfile
       target: runtime
-    command: uv run celery -A texponse.tasks.worker beat --loglevel=INFO
+    command: uv run celery -A texponse.tasks.background beat --loglevel=INFO
     env_file: .env
     depends_on: [postgres, qdrant, redis, worker]
     volumes: ["./src:/app/src"]

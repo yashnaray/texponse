@@ -13,10 +13,10 @@ logger = logging.getLogger(__name__)
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _SCRIPT_TAG_RE = re.compile(r"<script[^>]*>.*?</script>", re.IGNORECASE | re.DOTALL)
 _EVENT_HANDLER_RE = re.compile(r"on\w+\s*=\s*[\"']?[^\"'>\s]*[\"']?", re.IGNORECASE)
-_JS_PROTOCOL_RE = re.compile(r"javascript\s*:[^\\s]*", re.IGNORECASE)
+_JS_PROTOCOL_RE = re.compile(r"javascript\s*:[^\s]*", re.IGNORECASE)
 
 
-def sanitize_input(text: str, max_length: int = 100_000) -> str:
+def sanitize_input(text: str | None, max_length: int = 100_000) -> str:
     if text is None:
         return ""
 

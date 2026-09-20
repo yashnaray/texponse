@@ -4,7 +4,7 @@ import logging
 from typing import Any
 
 from qdrant_client import QdrantClient
-from qdrant_client.http.models import SparseVector
+from qdrant_client.http.models import PointStruct, SparseVector
 
 from texponse.integrations.openrouter import OpenRouterClient
 from texponse.rag.retriever import Embedder
@@ -43,18 +43,21 @@ class EmbeddingPipeline:
 
         embeddings = await self._embedder.embed_texts(chunks)
 
-        points: list[Any] = []
+        import asyncio
+        import uuid
+
+        points: list[PointStruct] = []
         for i, (chunk, vector) in enumerate(zip(chunks, embeddings, strict=True)):
-            point_id = f"{document_id}:{i}"
+            point_id = uuid.uuid5(uuid.NAMESPACE_URL, f"{document_id}:{i}").hex
             sparse = self._build_sparse_vector(chunk)
             points.append(
-                {
-                    "id": point_id,
-                    "vector": {
+                PointStruct(
+                    id=point_id,
+                    vector={
                         "dense": vector,
-                        "text_sparse": {"indices": sparse.indices, "values": sparse.values},
+                        "bm25": sparse,
                     },
-                    "payload": {
+                    payload={
                         "text": chunk,
                         "source_url": source_url,
                         "category": category,
@@ -63,10 +66,11 @@ class EmbeddingPipeline:
                         "last_updated": metadata.get("last_updated", "") if metadata else "",
                         **(metadata.get("extra", {}) if metadata else {}),
                     },
-                }
+                )
             )
 
-        self._qdrant.upsert(
+        await asyncio.to_thread(
+            self._qdrant.upsert,
             collection_name=self._collection,
             points=points,
             wait=True,

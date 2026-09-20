@@ -119,9 +119,28 @@ async def _process_conversation(
     conv = await repo.get_or_create(
         aircall_id=aircall_id,
         company_id=company_id,
-        direction="inbound" if event_type == "message.received" else "inbound",
+        direction="inbound",
         channel="sms" if event_type.startswith("message.") else "call",
     )
+
+    if content:
+        from texponse.db.models import ConversationEvent, ConversationEventType
+
+        try:
+            inbound_type = ConversationEventType(event_type)
+        except ValueError:
+            inbound_type = ConversationEventType.WEBHOOK_RECEIVED
+        await repo.add_event(
+            ConversationEvent(
+                conversation_id=conv.id,
+                event_type=inbound_type,
+                from_number=from_number or None,
+                to_number=to_number or None,
+                content=content,
+                direction="inbound",
+                raw_payload={"event_type": event_type},
+            )
+        )
 
     history_records = await repo.get_history(conv.id)
     history_msgs = [
@@ -130,12 +149,13 @@ async def _process_conversation(
         if e.content
     ]
 
-    query = content or ""
+    query = (content or "").strip()
 
-    passages = await retriever.retrieve(query=query)
+    passages = await retriever.retrieve(query=query) if query else []
 
     jobber_context: dict[str, Any] | None = None
     jobber_token = await _get_jobber_token(session, company_id)
+    jobber_client: JobberClient | None = None
     if jobber_token and from_number:
         try:
             jobber_client = JobberClient(
@@ -152,6 +172,12 @@ async def _process_conversation(
                 jobber_context = client_data
         except Exception as exc:
             logger.warning("Jobber enrichment failed: %s", exc)
+        finally:
+            if jobber_client is not None:
+                try:
+                    await jobber_client.close()
+                except Exception as exc:
+                    logger.warning("Jobber client close failed: %s", exc)
 
     prompt_context = PromptContext(
         passages=passages,
@@ -170,17 +196,7 @@ async def _process_conversation(
     response_model = orchestrator.to_db_model(response, conv.id)
     await repo.save_response(response_model)
 
-    await aircall.send_message(
-        from_number=to_number,
-        to_number=from_number,
-        content=response.content[:1500],
-    )
-
-    await aircall.close()
-    await openrouter._client.close()
-    await session.close()
-
-    return {
+    result: dict[str, Any] = {
         "conversation_id": conv.id,
         "response_preview": response.content[:200],
         "model_used": response.model_used,
@@ -193,6 +209,39 @@ async def _process_conversation(
         "was_fallback": response.was_fallback,
         "passages_retrieved": response.retrieved_passage_count,
     }
+
+    if from_number and to_number:
+        try:
+            await aircall.send_message(
+                from_number=to_number,
+                to_number=from_number,
+                content=response.content[:1500],
+            )
+        except Exception as exc:
+            logger.warning("Aircall send_message failed: %s", exc)
+            result["delivery_error"] = str(exc)
+    else:
+        logger.warning("Skipping Aircall send: missing from_number/to_number")
+        result["delivery_error"] = "missing phone numbers"
+
+    try:
+        await aircall.close()
+    except Exception as exc:
+        logger.warning("Aircall client close failed: %s", exc)
+    try:
+        await openrouter.close()
+    except Exception as exc:
+        logger.warning("OpenRouter client close failed: %s", exc)
+    try:
+        qdrant.close()
+    except Exception as exc:
+        logger.warning("Qdrant client close failed: %s", exc)
+    try:
+        await session.close()
+    except Exception as exc:
+        logger.warning("DB session close failed: %s", exc)
+
+    return result
 
 
 async def _get_jobber_token(session: AsyncSession, company_id: str) -> Any:
@@ -223,23 +272,25 @@ async def _refresh_jobber_tokens() -> dict[str, Any]:
 
     refreshed = 0
     try:
-        async with session:
-            from sqlalchemy import text as sql_text
+        from sqlmodel import select
 
-            stmt = sql_text("SELECT * FROM jobber_tokens WHERE expires_at < :now")
-            result = await session.exec(
-                stmt,
-                {"now": datetime.utcnow()},
-            )  # type: ignore[call-overload]
-            tokens = result.all()
-            for token in tokens:
-                if await token_repo.is_expired(token):
-                    resp = await jobber.refresh_token(token.refresh_token)
-                    token.access_token = resp["access_token"]
-                    token.refresh_token = resp.get("refresh_token", token.refresh_token)
-                    token.expires_at = datetime.utcnow() + timedelta(seconds=resp["expires_in"])
-                    await session.commit()
-                    refreshed += 1
+        from texponse.db.models import JobberToken
+
+        stmt = select(JobberToken).where(JobberToken.expires_at < datetime.utcnow())
+        result = await session.exec(stmt)
+        tokens = list(result.all())
+        for token in tokens:
+            if await token_repo.is_expired(token):
+                resp = await jobber.refresh_token(token.refresh_token)
+                if "access_token" not in resp:
+                    logger.warning("Jobber refresh missing access_token, skipping")
+                    continue
+                token.access_token = resp["access_token"]
+                token.refresh_token = resp.get("refresh_token", token.refresh_token)
+                expires_in = resp.get("expires_in", 3600)
+                token.expires_at = datetime.utcnow() + timedelta(seconds=expires_in)
+                await session.commit()
+                refreshed += 1
     finally:
         await session.close()
         await jobber.close()

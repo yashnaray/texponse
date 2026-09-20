@@ -58,8 +58,8 @@ class Settings(BaseSettings):
     # ── OpenRouter ───────────────────────────────────────────────────────
     openrouter_api_key: str = ""
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
-    openrouter_default_model: str = "meta-llama/llama-3.1-8b-instruct:free"
-    openrouter_fallback_model: str = "mistralai/mistral-7b-instruct:free"
+    openrouter_default_model: str = "openrouter/free"
+    openrouter_fallback_model: str = "google/gemma-4-31b-it:free"
     openrouter_embedding_model: str = "openai/text-embedding-3-small"
     openrouter_timeout: float = 60.0
 

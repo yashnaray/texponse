@@ -58,4 +58,8 @@ async def _index_docs(settings: Settings) -> None:
     else:
         logger.warning("No docs/knowledge directory found, skipping indexing")
 
-    await openrouter._client.close()
+    try:
+        qdrant.close()
+    except Exception as exc:
+        logger.warning("Qdrant client close failed: %s", exc)
+    await openrouter.close()

@@ -23,8 +23,9 @@ async def verify_aircall_webhook(
             detail="Missing webhook signature",
         )
 
+    secret = settings.aircall_webhook_secret or settings.aircall_api_token
     expected = hmac.new(
-        settings.aircall_api_token.encode("utf-8"),
+        secret.encode("utf-8"),
         body,
         hashlib.sha256,
     ).hexdigest()

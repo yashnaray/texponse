@@ -33,6 +33,18 @@ class ModelConfig:
 
 
 MODEL_CONFIGS = {
+    "openrouter/free": ModelConfig(
+        name="openrouter/free",
+        context_window=200000,
+        max_output_tokens=4096,
+        is_free=True,
+    ),
+    "google/gemma-4-31b-it:free": ModelConfig(
+        name="google/gemma-4-31b-it:free",
+        context_window=262144,
+        max_output_tokens=4096,
+        is_free=True,
+    ),
     "meta-llama/llama-3.1-8b-instruct:free": ModelConfig(
         name="meta-llama/llama-3.1-8b-instruct:free",
         context_window=131072,
@@ -71,8 +83,8 @@ class OpenRouterClient:
         self,
         api_key: str,
         base_url: str = "https://openrouter.ai/api/v1",
-        default_model: str = "meta-llama/llama-3.1-8b-instruct:free",
-        fallback_model: str = "mistralai/mistral-7b-instruct:free",
+        default_model: str = "openrouter/free",
+        fallback_model: str = "google/gemma-4-31b-it:free",
         timeout: float = 60.0,
         app_url: str = "https://texponse.ai",
         app_name: str = "Texponse",
@@ -99,6 +111,9 @@ class OpenRouterClient:
         self._circuit_open_until: float = 0.0
         self._consecutive_failures: int = 0
 
+    async def close(self) -> None:
+        await self._client.close()
+
     @property
     def circuit_open(self) -> bool:
         return time.time() < self._circuit_open_until
@@ -108,7 +123,12 @@ class OpenRouterClient:
         return self._consecutive_failures
 
     def _get_model_config(self, model: str) -> ModelConfig:
-        return MODEL_CONFIGS.get(model, MODEL_CONFIGS[self._default_model])
+        if model in MODEL_CONFIGS:
+            return MODEL_CONFIGS[model]
+        default = MODEL_CONFIGS.get(self._default_model)
+        if default is not None:
+            return default
+        return next(iter(MODEL_CONFIGS.values()))
 
     async def _check_rate_limit(self) -> None:
         min_interval = 1.0

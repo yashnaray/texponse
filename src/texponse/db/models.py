@@ -3,9 +3,10 @@ from __future__ import annotations
 from datetime import datetime
 from enum import StrEnum
 from typing import Any
+from uuid import uuid4
 
 from sqlalchemy import JSON, Column
-from sqlmodel import Field, Relationship, SQLModel
+from sqlmodel import Field, SQLModel
 
 
 class ConversationEventType(StrEnum):
@@ -42,7 +43,7 @@ class ConversationEventStatus(StrEnum):
 class User(SQLModel, table=True):
     __tablename__ = "users"
 
-    id: str = Field(default=None, primary_key=True)
+    id: str = Field(default_factory=lambda: uuid4().hex, primary_key=True)
     email: str = Field(index=True, unique=True)
     name: str
     phone_number: str | None = Field(default=None, index=True)
@@ -52,16 +53,11 @@ class User(SQLModel, table=True):
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 
-    assigned_conversations: list[Conversation] = Relationship(
-        back_populates="assigned_agent",
-        sa_relationship_kwargs={"lazy": "selectin"},
-    )
-
 
 class JobberToken(SQLModel, table=True):
     __tablename__ = "jobber_tokens"
 
-    id: str = Field(default=None, primary_key=True)
+    id: str = Field(default_factory=lambda: uuid4().hex, primary_key=True)
     company_id: str = Field(unique=True, index=True)
     access_token: str
     refresh_token: str
@@ -74,7 +70,7 @@ class JobberToken(SQLModel, table=True):
 class Conversation(SQLModel, table=True):
     __tablename__ = "conversations"
 
-    id: str = Field(default=None, primary_key=True)
+    id: str = Field(default_factory=lambda: uuid4().hex, primary_key=True)
     aircall_id: str = Field(index=True)
     company_id: str = Field(index=True)
     direction: str = Field()
@@ -86,24 +82,11 @@ class Conversation(SQLModel, table=True):
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 
-    assigned_agent: User | None = Relationship(
-        back_populates="assigned_conversations",
-        sa_relationship_kwargs={"lazy": "selectin"},
-    )
-    events: list[ConversationEvent] = Relationship(
-        back_populates="conversation",
-        sa_relationship_kwargs={"lazy": "selectin", "cascade": "all, delete-orphan"},
-    )
-    responses: list[Response] = Relationship(
-        back_populates="conversation",
-        sa_relationship_kwargs={"lazy": "selectin", "cascade": "all, delete-orphan"},
-    )
-
 
 class ConversationEvent(SQLModel, table=True):
     __tablename__ = "conversation_events"
 
-    id: str = Field(default=None, primary_key=True)
+    id: str = Field(default_factory=lambda: uuid4().hex, primary_key=True)
     conversation_id: str = Field(foreign_key="conversations.id", index=True)
     event_type: ConversationEventType = Field(index=True)
     status: ConversationEventStatus = Field(default=ConversationEventStatus.PENDING)
@@ -117,16 +100,11 @@ class ConversationEvent(SQLModel, table=True):
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 
-    conversation: Conversation = Relationship(
-        back_populates="events",
-        sa_relationship_kwargs={"lazy": "selectin"},
-    )
-
 
 class Response(SQLModel, table=True):
     __tablename__ = "responses"
 
-    id: str = Field(default=None, primary_key=True)
+    id: str = Field(default_factory=lambda: uuid4().hex, primary_key=True)
     conversation_id: str = Field(foreign_key="conversations.id", index=True)
     content: str
     model_used: str
@@ -138,8 +116,3 @@ class Response(SQLModel, table=True):
     was_fallback: bool = False
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
-
-    conversation: Conversation = Relationship(
-        back_populates="responses",
-        sa_relationship_kwargs={"lazy": "selectin"},
-    )

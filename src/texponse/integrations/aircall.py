@@ -27,23 +27,25 @@ class AircallClient:
         from_number: str,
         to_number: str,
         content: str,
+        timeout: float = 30.0,
     ) -> dict[str, Any]:
         resp = await self._client.post(
             "/messages",
             json={"from": from_number, "to": to_number, "content": content},
+            timeout=timeout,
         )
         resp.raise_for_status()
         data: dict[str, Any] = resp.json()
         return data
 
-    async def get_call(self, call_id: str) -> dict[str, Any]:
-        resp = await self._client.get(f"/calls/{call_id}")
+    async def get_call(self, call_id: str, timeout: float = 30.0) -> dict[str, Any]:
+        resp = await self._client.get(f"/calls/{call_id}", timeout=timeout)
         resp.raise_for_status()
         data: dict[str, Any] = resp.json()
         return data
 
-    async def get_contact(self, contact_id: str) -> dict[str, Any]:
-        resp = await self._client.get(f"/contacts/{contact_id}")
+    async def get_contact(self, contact_id: str, timeout: float = 30.0) -> dict[str, Any]:
+        resp = await self._client.get(f"/contacts/{contact_id}", timeout=timeout)
         resp.raise_for_status()
         data: dict[str, Any] = resp.json()
         return data
@@ -98,7 +100,11 @@ class AircallClient:
                     else from_val.get("phone_number")
                     if isinstance(from_val, dict)
                     else None,
-                    "to_number": to_val.get("phone_number") if isinstance(to_val, dict) else None,
+                    "to_number": to_val
+                    if isinstance(to_val, str)
+                    else to_val.get("phone_number")
+                    if isinstance(to_val, dict)
+                    else None,
                     "direction": "inbound"
                     if resource.get("direction") == "Incoming"
                     else "outbound",

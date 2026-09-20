@@ -9,7 +9,7 @@ from qdrant_client.http import models
 from qdrant_client.http.models import (
     Distance,
     SparseVector,
-    SparseVectorConfig,
+    SparseVectorParams,
     VectorParams,
 )
 
@@ -44,9 +44,15 @@ class Embedder:
 
         tokens = text.lower().split()
         token_set = sorted(set(tokens))
-        indices = [int(hashlib.md5(tok.encode()).hexdigest(), 16) % 100000 for tok in token_set]
-        values = [1.0] * len(token_set)
-        return SparseVector(indices=indices, values=values)
+        index_to_value: dict[int, float] = {}
+        for tok in token_set:
+            idx = int(hashlib.md5(tok.encode()).hexdigest(), 16) % 100000
+            index_to_value[idx] = index_to_value.get(idx, 0.0) + 1.0
+        sorted_indices = sorted(index_to_value)
+        return SparseVector(
+            indices=sorted_indices,
+            values=[index_to_value[i] for i in sorted_indices],
+        )
 
 
 class HybridRetriever:
@@ -65,32 +71,34 @@ class HybridRetriever:
     async def retrieve(
         self,
         query: str,
-        filters: dict[str, Any] | None = None,
+        filters: models.Filter | None = None,
     ) -> list[RetrievedPassage]:
+        import asyncio
+
         dense_vector = await self._embedder.embed_query(query)
         sparse_vector = Embedder.build_sparse_vector(query)
 
-        query_filter = None
-        if filters:
-            query_filter = models.Filter(**filters)
-
-        dense_results = self._qdrant.search(  # type: ignore[attr-defined]
-            collection_name=self._collection,
-            query_vector=dense_vector,
-            query_filter=query_filter,
+        dense_response = await asyncio.to_thread(
+            self._qdrant.query_points,
+            self._collection,
+            query=dense_vector,
+            using="dense",
+            query_filter=filters,
             with_payload=True,
             limit=self._top_k,
         )
 
-        sparse_results = self._qdrant.search(  # type: ignore[attr-defined]
-            collection_name=self._collection,
-            query_sparse_vector=sparse_vector,
-            query_filter=query_filter,
+        sparse_response = await asyncio.to_thread(
+            self._qdrant.query_points,
+            self._collection,
+            query=sparse_vector,
+            using="bm25",
+            query_filter=filters,
             with_payload=True,
             limit=self._top_k,
         )
 
-        passages = self._rrf_fusion(dense_results, sparse_results, k=60)
+        passages = self._rrf_fusion(dense_response.points, sparse_response.points, k=60)
         return passages[: self._top_k]
 
     def _rrf_fusion(
@@ -156,7 +164,7 @@ class HybridRetriever:
 def ensure_collection(
     qdrant_client: QdrantClient,
     collection_name: str,
-    vector_size: int = 768,
+    vector_size: int = 1536,
 ) -> None:
     try:
         qdrant_client.get_collection(collection_name)
@@ -166,10 +174,9 @@ def ensure_collection(
             collection_name=collection_name,
             vectors_config={"dense": VectorParams(size=vector_size, distance=Distance.COSINE)},
             sparse_vectors_config={
-                "bm25": SparseVectorConfig(  # type: ignore[call-arg, dict-item]
-                    index=models.SparseIndexConfig(  # type: ignore[call-arg]
-                        modifier=models.SparseModifier.IDF,  # type: ignore[attr-defined]
-                    )
+                "bm25": SparseVectorParams(
+                    index=models.SparseIndexParams(),
+                    modifier=models.Modifier.IDF,
                 )
             },
         )
