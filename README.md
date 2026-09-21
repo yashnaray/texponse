@@ -2,7 +2,7 @@
 
 An event-driven AI support agent that integrates **Aircall** (voice/SMS conversations),
 **Jobber** (home-service business context), **Qdrant** (vector search with hybrid RRF),
-and **OpenRouter** (free-tier LLMs) to provide automated, context-aware customer responses.
+and **OpenRouter** (free LLMs, yay!) to provide automated, context-aware customer responses.
 
 ## Quick Start
 
@@ -45,9 +45,9 @@ See [docs/tech-stack.md](docs/tech-stack.md) for the full rationale.
 
 ## API Endpoints
 
-- `POST /webhooks/aircall` — Aircall webhook receiver (signature-verified)
-- `POST /responses/generate` — Manually trigger response generation
-- `GET /health` — Health check
+- `POST /webhooks/aircall`: Aircall webhook receiver (signature-verified)
+- `POST /responses/generate`: Manually trigger response generation
+- `GET /health`: Health check
 
 ## Development
 
