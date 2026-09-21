@@ -1,4 +1,4 @@
-# Texponse — AI-Driven Voice/SMS Support Agent
+# Texponse: Aircall -> LLM -> Jobber integration 
 
 An event-driven AI support agent that integrates **Aircall** (voice/SMS conversations),
 **Jobber** (home-service business context), **Qdrant** (vector search with hybrid RRF),
