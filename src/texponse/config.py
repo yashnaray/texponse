@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -47,6 +48,7 @@ class Settings(BaseSettings):
     aircall_api_token: str = ""
     aircall_webhook_secret: str = ""
     aircall_base_url: str = "https://api.aircall.io/v1"
+    aircall_line_id: int | None = None
 
     # ── Jobber ───────────────────────────────────────────────────────────
     jobber_client_id: str = ""
@@ -77,6 +79,13 @@ class Settings(BaseSettings):
     response_token_reserve: int = 512
     max_response_tokens: int = 512
     rag_top_k: int = 10
+
+    @field_validator("aircall_line_id", mode="before")
+    @classmethod
+    def _empty_str_to_none(cls, value: object) -> object:
+        if value == "":
+            return None
+        return value
 
     @property
     def database_url(self) -> str:

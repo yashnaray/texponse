@@ -196,6 +196,13 @@ async def _process_conversation(
     response_model = orchestrator.to_db_model(response, conv.id)
     await repo.save_response(response_model)
 
+    logger.info(
+        "Generated response for conversation %s via %s: %s",
+        conv.id,
+        response.model_used,
+        response.content,
+    )
+
     result: dict[str, Any] = {
         "conversation_id": conv.id,
         "response_preview": response.content[:200],
@@ -210,19 +217,32 @@ async def _process_conversation(
         "passages_retrieved": response.retrieved_passage_count,
     }
 
-    if from_number and to_number:
+    if from_number and settings.aircall_line_id is not None:
         try:
             await aircall.send_message(
-                from_number=to_number,
+                line_id=settings.aircall_line_id,
                 to_number=from_number,
                 content=response.content[:1500],
             )
         except Exception as exc:
-            logger.warning("Aircall send_message failed: %s", exc)
-            result["delivery_error"] = str(exc)
-    else:
-        logger.warning("Skipping Aircall send: missing from_number/to_number")
+            import contextlib
+
+            detail = str(exc)
+            http_response = getattr(exc, "response", None)
+            if http_response is not None:
+                with contextlib.suppress(Exception):
+                    detail = f"{exc} | body: {http_response.text[:500]}"
+            logger.warning("Aircall send_message failed: %s", detail)
+            result["delivery_error"] = detail
+    elif not from_number:
+        logger.warning("Skipping Aircall send: missing from_number")
         result["delivery_error"] = "missing phone numbers"
+    else:
+        logger.warning("Skipping Aircall send: AIRCALL_LINE_ID is not configured")
+        result["delivery_error"] = (
+            "AIRCALL_LINE_ID is not configured; set it to the Aircall number ID "
+            "configured for Public API messaging"
+        )
 
     try:
         await aircall.close()

@@ -16,23 +16,82 @@ class AircallClient:
             base_url=settings.aircall_base_url,
             auth=(settings.aircall_api_id, settings.aircall_api_token),
             timeout=httpx.Timeout(30.0),
-            headers={"Content-Type": "application/json"},
+            headers={"Accept": "application/json"},
         )
+        self._json_headers = {"Content-Type": "application/json"}
 
     async def close(self) -> None:
         await self._client.aclose()
 
     async def send_message(
         self,
-        from_number: str,
+        line_id: int,
         to_number: str,
         content: str,
         timeout: float = 30.0,
     ) -> dict[str, Any]:
+        """Send an SMS via the Public API Messaging endpoint.
+
+        The Aircall number (``line_id``) must first be configured for Public
+        API messaging, otherwise Aircall returns 404. See
+        ``configure_number_for_messaging``.
+        """
         resp = await self._client.post(
-            "/messages",
-            json={"from": from_number, "to": to_number, "content": content},
+            f"/numbers/{line_id}/messages/send",
+            json={"to": to_number, "body": content},
+            headers=self._json_headers,
             timeout=timeout,
+        )
+        resp.raise_for_status()
+        data: dict[str, Any] = resp.json()
+        return data
+
+    async def list_numbers(self, timeout: float = 30.0) -> list[dict[str, Any]]:
+        """List Aircall numbers (used to find the ``line_id`` for sending)."""
+        resp = await self._client.get("/numbers", timeout=timeout)
+        resp.raise_for_status()
+        data: dict[str, Any] = resp.json()
+        result: list[dict[str, Any]] = data.get("numbers", [])
+        return result
+
+    async def configure_number_for_messaging(
+        self,
+        line_id: int,
+        callback_url: str,
+        timeout: float = 30.0,
+    ) -> dict[str, Any]:
+        """Configure a number for Public API messaging.
+
+        Warning: a number configured this way can no longer send SMS from
+        the Aircall app.
+        """
+        resp = await self._client.post(
+            f"/numbers/{line_id}/messages/configuration",
+            json={"callbackUrl": callback_url},
+            headers=self._json_headers,
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        data: dict[str, Any] = resp.json()
+        return data
+
+    async def get_number_messaging_config(
+        self,
+        line_id: int,
+        timeout: float = 30.0,
+    ) -> dict[str, Any]:
+        resp = await self._client.get(f"/numbers/{line_id}/messages/configuration", timeout=timeout)
+        resp.raise_for_status()
+        data: dict[str, Any] = resp.json()
+        return data
+
+    async def delete_number_messaging_config(
+        self,
+        line_id: int,
+        timeout: float = 30.0,
+    ) -> dict[str, Any]:
+        resp = await self._client.delete(
+            f"/numbers/{line_id}/messages/configuration", timeout=timeout
         )
         resp.raise_for_status()
         data: dict[str, Any] = resp.json()
@@ -61,6 +120,7 @@ class AircallClient:
         resp = await self._client.post(
             "/webhooks",
             json={"events": [event], "url": url},
+            headers=self._json_headers,
         )
         resp.raise_for_status()
         data: dict[str, Any] = resp.json()

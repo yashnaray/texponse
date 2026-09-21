@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 import uvicorn
+from celery.exceptions import TimeoutError as CeleryTimeoutError
 from fastapi import FastAPI, Request, Response, status
 from fastapi.responses import JSONResponse
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -14,6 +16,8 @@ from slowapi.util import get_remote_address
 
 from texponse.config import get_settings
 from texponse.db.database import create_all
+from texponse.tasks.background import app as celery_app
+from texponse.tasks.background import generate_response_task
 
 logger = logging.getLogger("texponse.main")
 
@@ -132,8 +136,6 @@ def create_app() -> FastAPI:
     @app.post("/responses/generate", status_code=status.HTTP_200_OK)
     @limiter.limit(settings.api_rate_limit)
     async def generate_response_endpoint(request: Request) -> JSONResponse:
-        from texponse.tasks.background import generate_response_task
-
         try:
             body = await request.json()
         except Exception:
@@ -146,7 +148,7 @@ def create_app() -> FastAPI:
                 {"status": "error", "message": "aircall_id is required"},
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             )
-        generate_response_task.delay(
+        task = generate_response_task.delay(
             company_id=body.get("company_id", "default"),
             aircall_id=body.get("aircall_id", ""),
             event_type=body.get("event_type", "message.received"),
@@ -154,7 +156,61 @@ def create_app() -> FastAPI:
             to_number=body.get("to_number", ""),
             content=body.get("content"),
         )
-        return JSONResponse({"status": "processing", "message": "Response queued"})
+        try:
+            outcome = await asyncio.to_thread(task.get, timeout=100.0)
+        except CeleryTimeoutError:
+            return JSONResponse(
+                {
+                    "status": "processing",
+                    "message": "Response still processing",
+                    "task_id": task.id,
+                },
+                status_code=status.HTTP_202_ACCEPTED,
+            )
+        except Exception as exc:
+            logger.exception("Response generation failed for task %s", task.id)
+            return JSONResponse(
+                {"status": "failed", "message": str(exc), "task_id": task.id},
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+        if isinstance(outcome, dict) and outcome.get("delivery_error"):
+            return JSONResponse(
+                {
+                    "status": "generated_with_delivery_error",
+                    "task_id": task.id,
+                    "result": outcome,
+                },
+                status_code=status.HTTP_502_BAD_GATEWAY,
+            )
+        return JSONResponse(
+            {"status": "completed", "task_id": task.id, "result": outcome},
+            status_code=status.HTTP_200_OK,
+        )
+
+    @app.get("/responses/result/{task_id}", status_code=status.HTTP_200_OK)
+    @limiter.limit(settings.api_rate_limit)
+    async def generate_response_result(request: Request, task_id: str) -> JSONResponse:
+        _ = request
+        async_result = celery_app.AsyncResult(task_id)
+        state = async_result.state
+        if state in ("PENDING", "STARTED", "RETRY"):
+            return JSONResponse(
+                {"status": "processing", "task_id": task_id, "state": state},
+                status_code=status.HTTP_202_ACCEPTED,
+            )
+        if state == "FAILURE":
+            return JSONResponse(
+                {
+                    "status": "failed",
+                    "task_id": task_id,
+                    "message": str(async_result.result),
+                },
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+        return JSONResponse(
+            {"status": "completed", "task_id": task_id, "result": async_result.result},
+            status_code=status.HTTP_200_OK,
+        )
 
     return app
 
