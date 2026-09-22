@@ -140,6 +140,50 @@ class AircallClient:
         return hmac.compare_digest(expected, signature)
 
     @staticmethod
+    def normalize_callback_event(raw: dict[str, Any]) -> dict[str, Any]:
+        """Normalize a proxy-mode messaging callback payload.
+
+        Proxy callbacks use ``{"event_name": ..., "data": {...}}`` instead of
+        the webhook ``{"event": ..., "resource": {...}}`` shape. Field names
+        inside ``data`` are handled defensively since Aircall does not
+        guarantee every field on every event.
+        """
+        event_type = str(raw.get("event_name", "") or "")
+        data = raw.get("data", {})
+        if not isinstance(data, dict):
+            data = {}
+
+        def _phone(value: Any) -> str | None:
+            if isinstance(value, str):
+                cleaned = value.strip().replace(" ", "").replace("-", "")
+                if cleaned and all(ch.isdigit() or ch == "+" for ch in cleaned):
+                    return cleaned if cleaned.startswith("+") else f"+{cleaned}"
+                return value or None
+            if isinstance(value, dict):
+                for key in ("phone_number", "phone", "number", "digits", "raw_digits"):
+                    nested = value.get(key)
+                    if isinstance(nested, str):
+                        resolved = _phone(nested)
+                        if resolved:
+                            return resolved
+            return None
+
+        from_val = _phone(data.get("from", data.get("from_number", data.get("raw_digits"))))
+        to_val = _phone(data.get("to", data.get("to_number", data.get("number"))))
+        content = data.get("body", data.get("content", data.get("text")))
+        direction = data.get("direction", "inbound")
+
+        return {
+            "event_type": event_type,
+            "aircall_message_id": data.get("id", data.get("message_id")),
+            "from_number": from_val,
+            "to_number": to_val,
+            "direction": direction,
+            "content": content if isinstance(content, str) else None,
+            "raw_payload": raw,
+        }
+
+    @staticmethod
     def normalize_event(raw: dict[str, Any]) -> dict[str, Any]:
         event_type = raw.get("event", "")
         resource = raw.get("resource", {})

@@ -49,6 +49,7 @@ class Settings(BaseSettings):
     aircall_webhook_secret: str = ""
     aircall_base_url: str = "https://api.aircall.io/v1"
     aircall_line_id: int | None = None
+    aircall_callback_token: str = ""
 
     # ── Jobber ───────────────────────────────────────────────────────────
     jobber_client_id: str = ""
