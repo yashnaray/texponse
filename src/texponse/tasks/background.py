@@ -179,6 +179,8 @@ async def _process_conversation(
                 except Exception as exc:
                     logger.warning("Jobber client close failed: %s", exc)
 
+    result_fallback_note: str | None = None
+
     prompt_context = PromptContext(
         passages=passages,
         conversation_history=history_msgs,
@@ -187,42 +189,69 @@ async def _process_conversation(
         customer_phone=from_number,
     )
 
-    response = await orchestrator.generate(
-        query=query,
-        context=prompt_context,
-        company_name="Texponse",
-    )
-
-    response_model = orchestrator.to_db_model(response, conv.id)
-    await repo.save_response(response_model)
+    response_content: str
+    model_used = "static-fallback"
+    prompt_tokens = completion_tokens = total_tokens = 0
+    latency_ms = 0
+    was_fallback = False
+    passages_count = len(passages)
+    try:
+        response = await orchestrator.generate(
+            query=query,
+            context=prompt_context,
+            company_name="Texponse",
+        )
+        response_model = orchestrator.to_db_model(response, conv.id)
+        await repo.save_response(response_model)
+        response_content = response.content
+        model_used = response.model_used
+        prompt_tokens = response.prompt_tokens
+        completion_tokens = response.completion_tokens
+        total_tokens = response.total_tokens
+        latency_ms = response.latency_ms
+        was_fallback = response.was_fallback
+        passages_count = response.retrieved_passage_count
+    except Exception as exc:
+        # LLM/RAG failure must not leave the customer with silence:
+        # fall back to a static SMS reply (regular-SMS behaviour).
+        logger.exception("LLM generation failed, using static fallback SMS: %s", exc)
+        response_content = (
+            "Thanks for your message — we've received it and our team "
+            "will follow up shortly."
+        )
+        model_used = "static-fallback"
+        was_fallback = True
+        result_fallback_note = f"llm_error: {exc}"
 
     logger.info(
         "Generated response for conversation %s via %s: %s",
         conv.id,
-        response.model_used,
-        response.content,
+        model_used,
+        response_content,
     )
 
     result: dict[str, Any] = {
         "conversation_id": conv.id,
-        "response_preview": response.content[:200],
-        "model_used": response.model_used,
+        "response_preview": response_content[:200],
+        "model_used": model_used,
         "tokens": {
-            "prompt": response.prompt_tokens,
-            "completion": response.completion_tokens,
-            "total": response.total_tokens,
+            "prompt": prompt_tokens,
+            "completion": completion_tokens,
+            "total": total_tokens,
         },
-        "latency_ms": response.latency_ms,
-        "was_fallback": response.was_fallback,
-        "passages_retrieved": response.retrieved_passage_count,
+        "latency_ms": latency_ms,
+        "was_fallback": was_fallback,
+        "passages_retrieved": passages_count,
     }
+    if result_fallback_note is not None:
+        result["fallback_note"] = result_fallback_note
 
     if from_number and settings.aircall_line_id is not None:
         try:
             await aircall.send_message(
                 line_id=settings.aircall_line_id,
                 to_number=from_number,
-                content=response.content[:1500],
+                content=response_content[:1500],
             )
         except Exception as exc:
             import contextlib
