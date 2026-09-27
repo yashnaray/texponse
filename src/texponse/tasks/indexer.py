@@ -29,17 +29,13 @@ async def _index_docs(settings: Settings) -> None:
         url=settings.qdrant_url,
         api_key=settings.qdrant_api_key,
     )
-    ensure_collection(qdrant, settings.qdrant_collection)
-
-    from texponse.integrations.openrouter import OpenRouterClient
     from texponse.rag.embedder import EmbeddingPipeline
+    from texponse.rag.retriever import Embedder
 
-    openrouter = OpenRouterClient(
-        api_key=settings.openrouter_api_key,
-        base_url=settings.openrouter_base_url,
-    )
+    embedder = Embedder(settings.embedder_model)
+    ensure_collection(qdrant, settings.qdrant_collection, vector_size=embedder.dim)
 
-    pipeline = EmbeddingPipeline(qdrant, openrouter, settings.qdrant_collection)
+    pipeline = EmbeddingPipeline(qdrant, embedder, settings.qdrant_collection)
 
     docs_path = "docs/knowledge"
     if os.path.isdir(docs_path):
@@ -62,4 +58,3 @@ async def _index_docs(settings: Settings) -> None:
         qdrant.close()
     except Exception as exc:
         logger.warning("Qdrant client close failed: %s", exc)
-    await openrouter.close()

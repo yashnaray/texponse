@@ -13,8 +13,6 @@ from qdrant_client.http.models import (
     VectorParams,
 )
 
-from texponse.integrations.openrouter import OpenRouterClient
-
 logger = logging.getLogger(__name__)
 
 
@@ -27,12 +25,28 @@ class RetrievedPassage:
 
 
 class Embedder:
-    def __init__(self, openrouter_client: OpenRouterClient) -> None:
-        self._client = openrouter_client
-        self._model = "openai/text-embedding-3-small"
+    """Local ONNX embeddings via FastEmbed (no API calls, no quota).
+
+    Replaces the old OpenRouter-hosted `openai/text-embedding-3-small`
+    (1536-dim). Default model `BAAI/bge-small-en-v1.5` is 384-dim.
+    """
+
+    def __init__(self, model: str = "BAAI/bge-small-en-v1.5") -> None:
+        from fastembed import TextEmbedding
+
+        self._model_name = model
+        self._emb = TextEmbedding(model)
+
+    @property
+    def dim(self) -> int:
+        return int(self._emb.embedding_size)
 
     async def embed_texts(self, texts: list[str]) -> list[list[float]]:
-        return await self._client.embed(texts, model=self._model)
+        import asyncio
+
+        return await asyncio.to_thread(
+            lambda: [list(map(float, v)) for v in self._emb.embed(texts)]
+        )
 
     async def embed_query(self, text: str) -> list[float]:
         embeddings = await self.embed_texts([text])
@@ -124,6 +138,8 @@ class HybridRetriever:
                         "category": payload.get("category", ""),
                         "last_updated": payload.get("last_updated", ""),
                         "chunk_index": payload.get("chunk_index", 0),
+                        "company_id": payload.get("company_id", ""),
+                        "phone_hashes": payload.get("phone_hashes", []),
                     },
                 )
 
@@ -142,6 +158,8 @@ class HybridRetriever:
                         "category": payload.get("category", ""),
                         "last_updated": payload.get("last_updated", ""),
                         "chunk_index": payload.get("chunk_index", 0),
+                        "company_id": payload.get("company_id", ""),
+                        "phone_hashes": payload.get("phone_hashes", []),
                     },
                 )
 
@@ -164,12 +182,9 @@ class HybridRetriever:
 def ensure_collection(
     qdrant_client: QdrantClient,
     collection_name: str,
-    vector_size: int = 1536,
+    vector_size: int = 384,
 ) -> None:
-    try:
-        qdrant_client.get_collection(collection_name)
-        logger.info("Collection '%s' already exists", collection_name)
-    except Exception:
+    def _create() -> None:
         qdrant_client.recreate_collection(
             collection_name=collection_name,
             vectors_config={"dense": VectorParams(size=vector_size, distance=Distance.COSINE)},
@@ -181,3 +196,45 @@ def ensure_collection(
             },
         )
         logger.info("Created collection '%s' with hybrid schema", collection_name)
+        # Payload indexes required for caller-scoped filtering (category,
+        # company_id, phone_hashes). Without these, Qdrant falls back to
+        # slow scans and may skip the filter under load.
+        for field, schema in (
+            ("category", models.PayloadSchemaType.KEYWORD),
+            ("company_id", models.PayloadSchemaType.KEYWORD),
+            ("phone_hashes", models.PayloadSchemaType.KEYWORD),
+        ):
+            try:
+                qdrant_client.create_payload_index(
+                    collection_name=collection_name,
+                    field_name=field,
+                    field_schema=schema,
+                )
+            except Exception as exc:  # index may already exist
+                logger.debug("Payload index '%s' not created: %s", field, exc)
+
+    try:
+        info = qdrant_client.get_collection(collection_name)
+        try:
+            vectors = info.config.params.vectors if info.config.params else None
+            existing: int | None = None
+            if isinstance(vectors, dict):
+                vp = vectors.get("dense")
+                if isinstance(vp, VectorParams):
+                    existing = int(vp.size)
+            elif isinstance(vectors, VectorParams):
+                existing = int(vectors.size)
+        except Exception:
+            existing = None
+        if existing is not None and int(existing) != int(vector_size):
+            logger.warning(
+                "Collection '%s' dim %s != %s, recreating (old points dropped)",
+                collection_name,
+                existing,
+                vector_size,
+            )
+            _create()
+        else:
+            logger.info("Collection '%s' already exists", collection_name)
+    except Exception:
+        _create()

@@ -17,7 +17,7 @@ from texponse.integrations.jobber import JobberClient
 from texponse.integrations.openrouter import OpenRouterClient
 from texponse.rag.orchestrator import LLMOrchestrator
 from texponse.rag.prompt_builder import PromptBuilder, PromptContext
-from texponse.rag.retriever import Embedder, HybridRetriever
+from texponse.rag.retriever import Embedder, HybridRetriever, RetrievedPassage
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +47,7 @@ def _create_celery() -> Celery:
             },
             "sync-jobber-data": {
                 "task": "texponse.tasks.sync_jobber_data",
-                "schedule": 1800.0,  # 30 minutes
+                "schedule": 3600.0,  # 1 hour
             },
             "health-check": {
                 "task": "texponse.tasks.health_check",
@@ -111,7 +111,7 @@ async def _process_conversation(
         url=settings.qdrant_url,
         api_key=settings.qdrant_api_key,
     )
-    embedder_instance = Embedder(openrouter)
+    embedder_instance = Embedder(settings.embedder_model)
     retriever = HybridRetriever(
         qdrant, embedder_instance, settings.qdrant_collection, settings.rag_top_k
     )
@@ -151,7 +151,73 @@ async def _process_conversation(
 
     query = (content or "").strip()
 
-    passages = await retriever.retrieve(query=query) if query else []
+    from qdrant_client.http import models as _qmodels
+
+    from texponse.security.guardrails import active_peppers
+    from texponse.security.guardrails import phone_hash as _caller_hash
+    from texponse.security.guardrails import redact_pii as _redact
+
+    _peppers = active_peppers(
+        settings.secret_key, settings.phone_hash_pepper, settings.phone_hash_pepper_previous
+    )
+    _hashes = sorted({_caller_hash(from_number, pepper=p) for p in _peppers} - {""})
+    _ch = _hashes[0] if _hashes else ""
+    if _ch:
+        _qfilter = _qmodels.Filter(
+            should=[
+                _qmodels.Filter(
+                    must=[
+                        _qmodels.FieldCondition(
+                            key="category",
+                            match=_qmodels.MatchValue(value="jobber"),
+                        ),
+                        _qmodels.FieldCondition(
+                            key="company_id",
+                            match=_qmodels.MatchValue(value=company_id),
+                        ),
+                        _qmodels.FieldCondition(
+                            key="phone_hashes",
+                            match=_qmodels.MatchAny(any=_hashes),
+                        ),
+                    ]
+                ),
+                _qmodels.Filter(
+                    must_not=[
+                        _qmodels.FieldCondition(
+                            key="category",
+                            match=_qmodels.MatchValue(value="jobber"),
+                        ),
+                    ]
+                ),
+            ]
+        )
+    else:
+        # Unknown caller: never return jobber client chunks.
+        _qfilter = _qmodels.Filter(
+            must_not=[
+                _qmodels.FieldCondition(
+                    key="category",
+                    match=_qmodels.MatchValue(value="jobber"),
+                ),
+            ]
+        )
+    passages = await retriever.retrieve(query=query, filters=_qfilter) if query else []
+    # Defense-in-depth: Qdrant filter is the primary guard, but never trust it
+    # alone — drop any jobber passage that isn't scoped to this caller/company.
+    if passages:
+        verified: list[RetrievedPassage] = []
+        for p in passages:
+            meta = p.metadata or {}
+            if meta.get("category") == "jobber":
+                phs = set(meta.get("phone_hashes") or [])
+                if not _hashes or phs.isdisjoint(_hashes):
+                    logger.warning("Dropping cross-caller jobber passage from %s", p.source)
+                    continue
+                if meta.get("company_id", company_id) != company_id:
+                    logger.warning("Dropping cross-tenant jobber passage from %s", p.source)
+                    continue
+            verified.append(p)
+        passages = verified
 
     jobber_context: dict[str, Any] | None = None
     jobber_token = await _get_jobber_token(session, company_id)
@@ -216,8 +282,7 @@ async def _process_conversation(
         # fall back to a static SMS reply (regular-SMS behaviour).
         logger.exception("LLM generation failed, using static fallback SMS: %s", exc)
         response_content = (
-            "Thanks for your message — we've received it and our team "
-            "will follow up shortly."
+            "Thanks for your message — we've received it and our team will follow up shortly."
         )
         model_used = "static-fallback"
         was_fallback = True
@@ -227,12 +292,12 @@ async def _process_conversation(
         "Generated response for conversation %s via %s: %s",
         conv.id,
         model_used,
-        response_content,
+        _redact(response_content[:200]),
     )
 
     result: dict[str, Any] = {
         "conversation_id": conv.id,
-        "response_preview": response_content[:200],
+        "response_preview": _redact(response_content[:200]),
         "model_used": model_used,
         "tokens": {
             "prompt": prompt_tokens,
@@ -353,8 +418,125 @@ def sync_jobber_data_task() -> dict[str, Any]:
 
 
 async def _sync_jobber_data() -> dict[str, Any]:
-    logger.info("Jobber data sync triggered (placeholder)")
-    return {"synced": True}
+    from sqlmodel import select
+
+    from texponse.db.models import JobberToken
+    from texponse.integrations.jobber import JobberClient
+    from texponse.rag.retriever import ensure_collection
+
+    settings = get_settings()
+    session = get_async_session()
+    qdrant = QdrantClient(url=settings.qdrant_url, api_key=settings.qdrant_api_key)
+    jobber = JobberClient(
+        client_id=settings.jobber_client_id,
+        client_secret=settings.jobber_client_secret,
+        redirect_uri=settings.jobber_redirect_uri,
+        graphql_version=settings.jobber_graphql_version,
+        base_url=settings.jobber_base_url,
+    )
+    try:
+        from texponse.rag.retriever import Embedder as _Embedder
+
+        _embedder = _Embedder(settings.embedder_model)
+        ensure_collection(qdrant, settings.qdrant_collection, vector_size=_embedder.dim)
+        result = await session.exec(select(JobberToken))
+        tokens = list(result.all())
+        clients_total = chunks_total = 0
+        import asyncio as _asyncio
+        import uuid as _uuid
+
+        from qdrant_client.http.models import PointStruct as _Point
+
+        sem = _asyncio.Semaphore(4)
+
+        async def _embed_batch(texts: list[str]) -> list[list[float]]:
+            async with sem:
+                return await _embedder.embed_texts(texts)
+
+        for token in tokens:
+            try:
+                clients = await jobber.list_all_clients(token.access_token)
+            except Exception as exc:
+                logger.warning("Jobber sync failed for %s: %s", token.company_id, exc)
+                continue
+            from texponse.security.guardrails import active_peppers
+            from texponse.security.guardrails import phone_hash as _ph
+            from texponse.security.guardrails import redact_pii as _redact
+
+            _sync_pepper = active_peppers(
+                settings.secret_key,
+                settings.phone_hash_pepper,
+                settings.phone_hash_pepper_previous,
+            )[0]
+
+            docs: list[tuple[str, str, str, dict]] = []
+            for c in clients:
+                phones_list = [
+                    p.get("number", "") for p in (c.get("phones") or []) if p.get("number")
+                ]
+                hashes = sorted({_ph(p, pepper=_sync_pepper) for p in phones_list} - {""})
+                jobs = (c.get("jobs") or {}).get("nodes", []) or []
+                jobs_txt = "; ".join(
+                    f"{j.get('title', '')} ({j.get('jobStatus', '')}, ${j.get('total', 0)})"
+                    for j in jobs
+                )
+                text = _redact(
+                    f"Client: {c.get('name', '')}\nCompany: {c.get('companyName', '')}\n"
+                    f"Balance: ${c.get('balance', 0)}\nJobs: {jobs_txt}"
+                )
+                docs.append(
+                    (
+                        f"jobber-{token.company_id}-{c.get('id', '')}",
+                        text,
+                        f"jobber://{token.company_id}/clients/{c.get('id', '')}",
+                        {
+                            "company_id": token.company_id,
+                            "phone_hashes": hashes,
+                            "phone_hash": hashes[0] if hashes else "",
+                        },
+                    )
+                )
+            # Batch embed 32 docs per API call instead of 1 call per doc.
+            for i in range(0, len(docs), 32):
+                batch = docs[i : i + 32]
+                vectors = await _embed_batch([t for _, t, _, _ in batch])
+                points = []
+                for (doc_id, chunk, url, extra), vec in zip(batch, vectors, strict=True):
+                    points.append(
+                        _Point(
+                            id=_uuid.uuid5(_uuid.NAMESPACE_URL, f"{doc_id}:0").hex,
+                            vector={
+                                "dense": vec,
+                                "bm25": _Embedder.build_sparse_vector(chunk),
+                            },
+                            payload={
+                                "text": chunk,
+                                "source_url": url,
+                                "category": "jobber",
+                                "document_id": doc_id,
+                                "chunk_index": 0,
+                                "last_updated": "",
+                                **extra,
+                            },
+                        )
+                    )
+                await _asyncio.to_thread(
+                    qdrant.upsert,
+                    collection_name=settings.qdrant_collection,
+                    points=points,
+                    wait=True,
+                )
+                chunks_total += len(points)
+                clients_total += len(batch)
+        logger.info("Jobber sync: %d clients, %d chunks", clients_total, chunks_total)
+        return {"synced_clients": clients_total, "chunks": chunks_total}
+    finally:
+        await session.close()
+        await jobber.close()
+        try:
+            qdrant.close()
+        except Exception as exc:
+            logger.warning("Qdrant client close failed: %s", exc)
 
 
 @app.task(name="texponse.tasks.health_check")

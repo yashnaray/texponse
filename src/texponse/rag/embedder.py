@@ -6,7 +6,6 @@ from typing import Any
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import PointStruct, SparseVector
 
-from texponse.integrations.openrouter import OpenRouterClient
 from texponse.rag.retriever import Embedder
 
 logger = logging.getLogger(__name__)
@@ -16,11 +15,11 @@ class EmbeddingPipeline:
     def __init__(
         self,
         qdrant: QdrantClient,
-        openrouter: OpenRouterClient,
+        embedder: Embedder,
         collection_name: str,
     ) -> None:
         self._qdrant = qdrant
-        self._embedder = Embedder(openrouter)
+        self._embedder = embedder
         self._collection = collection_name
         self._chunk_size = 512
         self._chunk_overlap = 50
@@ -61,6 +60,9 @@ class EmbeddingPipeline:
                         "text": chunk,
                         "source_url": source_url,
                         "category": category,
+                        "company_id": (
+                            metadata.get("company_id", "global") if metadata else "global"
+                        ),
                         "document_id": document_id,
                         "chunk_index": i,
                         "last_updated": metadata.get("last_updated", "") if metadata else "",

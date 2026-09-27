@@ -22,6 +22,27 @@ from texponse.tasks.background import generate_response_task
 
 logger = logging.getLogger("texponse.main")
 
+try:
+    from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
+except ImportError:  # pragma: no cover - metrics optional without dep
+    CONTENT_TYPE_LATEST = "text/plain"
+    Counter = Histogram = None  # type: ignore[assignment,misc]
+
+    def generate_latest() -> bytes:  # type: ignore[misc]
+        return b"# prometheus-client not installed\n"
+
+
+REQUEST_COUNT = (
+    Counter("texponse_http_requests_total", "Total HTTP requests", ["method", "path", "status"])
+    if Counter is not None
+    else None
+)
+REQUEST_LATENCY = (
+    Histogram("texponse_http_request_duration_seconds", "HTTP request latency", ["method", "path"])
+    if Histogram is not None
+    else None
+)
+
 
 def create_app() -> FastAPI:
     settings = get_settings()
@@ -35,12 +56,31 @@ def create_app() -> FastAPI:
 
         qdrant = QdrantClient(url=settings.qdrant_url, api_key=settings.qdrant_api_key)
         try:
-            ensure_collection(qdrant, settings.qdrant_collection)
+            from texponse.rag.retriever import Embedder as _LifEmbedder
+
+            ensure_collection(
+                qdrant,
+                settings.qdrant_collection,
+                vector_size=_LifEmbedder(settings.embedder_model).dim,
+            )
         finally:
             try:
                 qdrant.close()
             except Exception as exc:
                 logger.warning("Qdrant client close failed: %s", exc)
+        # Seed Jobber -> Qdrant on startup so beat's hourly timer doesn't
+        # leave the first hour empty. Fire-and-forget to the worker.
+        try:
+            from texponse.tasks.background import (
+                refresh_jobber_tokens_task,
+                sync_jobber_data_task,
+            )
+
+            refresh_jobber_tokens_task.delay()
+            sync_jobber_data_task.delay()
+            logger.info("Queued startup Jobber token refresh + data sync")
+        except Exception as exc:
+            logger.warning("Startup Jobber sync queue failed: %s", exc)
         yield
 
     app = FastAPI(
@@ -50,18 +90,110 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
+    storage_uri = settings.redis_url
+    try:
+        import redis as sync_redis
+
+        probe = sync_redis.Redis.from_url(settings.redis_url, socket_connect_timeout=2)
+        probe.ping()
+        probe.close()
+    except Exception as exc:
+        logger.warning("Redis unreachable, rate limiting falls back to memory: %s", exc)
+        storage_uri = "memory://"
     limiter = Limiter(
         key_func=get_remote_address,
         default_limits=[settings.api_rate_limit],
-        storage_uri=settings.redis_url,
+        storage_uri=storage_uri,
     )
     app.state.limiter = limiter
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)  # type: ignore[arg-type]
     app.add_middleware(SlowAPIMiddleware)
 
+    try:
+        from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+
+        FastAPIInstrumentor.instrument_app(app)
+    except Exception as exc:
+        logger.warning("OTel FastAPI instrumentation skipped: %s", exc)
+
+    @app.middleware("http")
+    async def _prometheus_middleware(request: Request, call_next: Any) -> Any:
+        import time
+
+        start = time.perf_counter()
+        response = await call_next(request)
+        if REQUEST_COUNT is not None and REQUEST_LATENCY is not None:
+            route = request.scope.get("route")
+            path = getattr(route, "path", request.url.path) if route else request.url.path
+            REQUEST_COUNT.labels(request.method, path, str(response.status_code)).inc()
+            REQUEST_LATENCY.labels(request.method, path).observe(time.perf_counter() - start)
+        return response
+
+    @app.get("/metrics")
+    @limiter.exempt
+    async def metrics() -> Response:
+        return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
     @app.get("/health")
+    @limiter.exempt
     async def health() -> dict[str, str]:
         return {"status": "healthy"}
+
+    @app.get("/ready")
+    async def ready() -> JSONResponse:
+        import httpx
+        import sqlalchemy
+
+        from texponse.db.database import get_async_engine
+
+        engine = get_async_engine()
+
+        checks: dict[str, str] = {}
+        ok = True
+        try:
+            async with engine.connect() as conn:
+                await conn.execute(sqlalchemy.text("SELECT 1"))
+            checks["postgres"] = "ok"
+        except Exception as exc:
+            ok = False
+            checks["postgres"] = f"error: {exc}"
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                r = await client.get(f"{settings.qdrant_url}/collections")
+                r.raise_for_status()
+            checks["qdrant"] = "ok"
+        except Exception as exc:
+            ok = False
+            checks["qdrant"] = f"error: {exc}"
+        try:
+            import redis.asyncio as aioredis
+
+            rc = aioredis.from_url(settings.redis_url, socket_connect_timeout=5)
+            await rc.ping()
+            await rc.aclose()
+            checks["redis"] = "ok"
+        except Exception as exc:
+            ok = False
+            checks["redis"] = f"error: {exc}"
+        try:
+            insp = celery_app.control.inspect(timeout=5)
+            stats = insp.stats() if insp else None
+            checks["celery"] = "ok" if stats else "no workers responding"
+            if not stats:
+                ok = False
+        except Exception as exc:
+            ok = False
+            checks["celery"] = f"error: {exc}"
+        return JSONResponse(
+            {"status": "ready" if ok else "not_ready", "checks": checks},
+            status_code=status.HTTP_200_OK if ok else status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+
+    @app.get("/health/prod-check")
+    async def prod_check() -> JSONResponse:
+        issues = get_settings().validate_production()
+        code = status.HTTP_200_OK if not issues else status.HTTP_503_SERVICE_UNAVAILABLE
+        return JSONResponse({"ready_for_prod": not issues, "issues": issues}, status_code=code)
 
     async def _ingest(normalized: dict[str, Any], payload: dict[str, Any]) -> None:
         from texponse.db.database import get_async_session
@@ -81,7 +213,7 @@ def create_app() -> FastAPI:
         repo = ConversationRepository(session)
 
         try:
-            company_id = payload.get("company_id", "default")
+            company_id = payload.get("company_id", "servicePros")
             aircall_id = (
                 normalized.get("aircall_call_id") or normalized.get("aircall_message_id") or ""
             )
@@ -202,7 +334,7 @@ def create_app() -> FastAPI:
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             )
         task = generate_response_task.delay(
-            company_id=body.get("company_id", "default"),
+            company_id=body.get("company_id", "servicePros"),
             aircall_id=body.get("aircall_id", ""),
             event_type=body.get("event_type", "message.received"),
             from_number=body.get("from_number", ""),
@@ -264,6 +396,90 @@ def create_app() -> FastAPI:
             {"status": "completed", "task_id": task_id, "result": async_result.result},
             status_code=status.HTTP_200_OK,
         )
+
+    @app.get("/auth/jobber/login", status_code=status.HTTP_200_OK)
+    async def jobber_login(request: Request) -> JSONResponse:
+        import secrets
+        from urllib.parse import urlencode
+
+        js = get_settings()
+        state = secrets.token_urlsafe(16)
+        params = {
+            "response_type": "code",
+            "client_id": js.jobber_client_id,
+            "redirect_uri": js.jobber_redirect_uri,
+            "state": state,
+        }
+        url = f"https://api.getjobber.com/api/oauth/authorize?{urlencode(params)}"
+        return JSONResponse({"authorize_url": url, "state": state})
+
+    @app.get("/webhooks/jobber/callback", status_code=status.HTTP_200_OK)
+    async def jobber_callback(request: Request) -> JSONResponse:
+        from datetime import datetime, timedelta
+
+        code = request.query_params.get("code", "")
+        if not code:
+            return JSONResponse(
+                {"status": "error", "message": "missing ?code=... (Jobber denied or bad redirect)"},
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+        company_id = request.query_params.get("company_id", "servicePros")
+        js = get_settings()
+        from texponse.integrations.jobber import JobberClient
+
+        client = JobberClient(
+            client_id=js.jobber_client_id,
+            client_secret=js.jobber_client_secret,
+            redirect_uri=js.jobber_redirect_uri,
+            graphql_version=js.jobber_graphql_version,
+            base_url=js.jobber_base_url,
+        )
+        try:
+            tokens = await client.exchange_code(code)
+        except Exception as exc:
+            logger.exception("Jobber code exchange failed")
+            return JSONResponse(
+                {"status": "error", "message": f"code exchange failed: {exc}"},
+                status_code=status.HTTP_502_BAD_GATEWAY,
+            )
+        finally:
+            import contextlib
+
+            with contextlib.suppress(Exception):
+                await client.close()
+        if "access_token" not in tokens:
+            return JSONResponse(
+                {"status": "error", "message": f"no access_token: {tokens}"},
+                status_code=status.HTTP_502_BAD_GATEWAY,
+            )
+        from texponse.db.database import get_async_session
+        from texponse.db.models import JobberToken
+        from texponse.db.repositories import JobberTokenRepository
+
+        session = get_async_session()
+        try:
+            repo = JobberTokenRepository(session)
+            expires_in = int(tokens.get("expires_in", 3600))
+            existing = await repo.get(company_id)
+            if existing:
+                existing.access_token = tokens["access_token"]
+                existing.refresh_token = tokens.get("refresh_token", existing.refresh_token)
+                existing.expires_at = datetime.utcnow() + timedelta(seconds=expires_in)
+                await session.commit()
+            else:
+                await repo.save(
+                    JobberToken(
+                        company_id=company_id,
+                        access_token=tokens["access_token"],
+                        refresh_token=tokens.get("refresh_token", ""),
+                        expires_at=datetime.utcnow() + timedelta(seconds=expires_in),
+                    )
+                )
+                await session.commit()
+        finally:
+            await session.close()
+        # quick sanity check: query Jobber
+        return JSONResponse({"status": "connected", "company_id": company_id})
 
     return app
 

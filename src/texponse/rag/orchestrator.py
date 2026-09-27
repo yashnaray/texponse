@@ -85,6 +85,9 @@ class LLMOrchestrator:
 
         content = result.get("content", "")
         content = self._redact_pii(content)
+        from texponse.security.guardrails import to_plaintext
+
+        content = to_plaintext(content)
 
         latency_ms = int((time.perf_counter() - start) * 1000)
 

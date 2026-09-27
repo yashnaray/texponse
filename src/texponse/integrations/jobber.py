@@ -94,60 +94,80 @@ class JobberClient:
         self, phone_number: str, access_token: str
     ) -> dict[str, Any] | None:
         query = """
-        query SearchClients($search: String!) {
-          searchClients(search: $search) {
-            clients {
+        query ListClients($first: Int) {
+          clients(first: $first) {
+            nodes {
               id
               firstName
               lastName
               name
               companyName
-              phone
+              phones { number primary }
               email
               balance
               isLead
-              clientProperties {
-                id
-                name
-                address {
-                  street
-                  city
-                  province
-                  postalCode
-                  country
-                }
-              }
-              jobs {
-                id
-                title
-                jobStatus
-                jobType
-                total
-                startAt
-                endAt
-                instructions
-              }
-              quotes {
-                id
-                title
-                quoteStatus
-                total
-              }
-              invoices {
-                id
-                invoiceNumber
-                invoiceStatus
-                total
-              }
             }
+            totalCount
           }
         }
         """
-        result = await self.graphql(query, {"search": phone_number}, access_token)
+        result = await self.graphql(query, {"first": 50}, access_token)
         data = result.get("data", {})
-        search = data.get("searchClients", {})
-        clients = search.get("clients", []) if isinstance(search, dict) else []
-        return clients[0] if clients else None
+        nodes: list[dict[str, Any]] = (
+            data.get("clients", {}).get("nodes", []) or [] if isinstance(data, dict) else []
+        )
+
+        def _digits(s: str) -> str:
+            return "".join(c for c in s if c.isdigit())
+
+        want = _digits(phone_number)
+        # Try exact (last-10-digit) match first, then fall back to first client.
+        for c in nodes:
+            phones = c.get("phones", []) or []
+            for p in phones:
+                num = str(p.get("number", ""))
+                if num and _digits(num)[-10:] == want[-10:] and len(want) >= 10:
+                    return c
+        return None
+
+    async def list_all_clients(self, access_token: str, limit: int = 200) -> list[dict[str, Any]]:
+        query = """
+        query ListClients($first: Int, $after: String) {
+          clients(first: $first, after: $after) {
+            nodes {
+              id
+              name
+              firstName
+              lastName
+              companyName
+              phones { number primary }
+              email
+              balance
+              isLead
+              jobs(first: 5) {
+                nodes { id title jobStatus total }
+              }
+            }
+            pageInfo { hasNextPage endCursor }
+            totalCount
+          }
+        }
+        """
+        out: list[dict[str, Any]] = []
+        after: str | None = None
+        while len(out) < limit:
+            batch = min(50, limit - len(out))
+            result = await self.graphql(query, {"first": batch, "after": after}, access_token)
+            conn = result.get("data", {}).get("clients", {})
+            out.extend(conn.get("nodes", []) or [])
+            page = conn.get("pageInfo", {})
+            if not page.get("hasNextPage"):
+                break
+            new_after = page.get("endCursor")
+            if not new_after or new_after == after:
+                break
+            after = new_after
+        return out
 
     async def get_client_properties(
         self, client_id: str, access_token: str

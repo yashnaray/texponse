@@ -87,3 +87,62 @@ def redact_pii(text: str) -> str:
     text = phone_re.sub("[PHONE_REDACTED]", text)
     text = cc_re.sub("[CARD_REDACTED]", text)
     return text
+
+
+def phone_hash(phone: str | None, pepper: str = "") -> str:
+    """Stable SHA-256 over normalized digits (last 10) for caller-scoping.
+
+    Returns "" for missing/short numbers so those points never match a caller.
+    When `pepper` is set, uses HMAC-SHA256 so hashes are not brute-forceable
+    from the 10-digit space (~10B candidates for unsalted SHA-256).
+    """
+    import hashlib
+    import hmac
+
+    if not phone:
+        return ""
+    digits = "".join(c for c in phone if c.isdigit())
+    if len(digits) < 10:
+        return ""
+    normalized = digits[-10:].encode()
+    if pepper:
+        return hmac.new(pepper.encode(), normalized, hashlib.sha256).hexdigest()
+    return hashlib.sha256(normalized).hexdigest()
+
+
+def phone_hash_match(phone: str | None, candidate: str, peppers: list[str]) -> bool:
+    """True if `candidate` equals the hash under any of `peppers`.
+
+    Used during pepper rotation: old points still match via the previous
+    pepper until a re-sync rewrites them with the primary pepper.
+    """
+    import hmac as _hmac
+
+    return any(
+        _hmac.compare_digest(phone_hash(phone, pepper=p), candidate) for p in peppers if candidate
+    )
+
+
+def active_peppers(secret_key: str, primary: str = "", previous: str = "") -> list[str]:
+    """Ordered [primary, previous] peppers, falling back to secret_key."""
+    pep = primary or secret_key
+    prev = previous or ""
+    return [pep] + ([prev] if prev and prev != pep else [])
+
+
+def to_plaintext(text: str) -> str:
+    """Strip markdown/HTML to SMS-safe plain text."""
+    text = _SCRIPT_TAG_RE.sub("", text)
+    text = _HTML_TAG_RE.sub("", text)
+    # markdown links/images -> label text
+    text = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", text)
+    text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", text)
+    # bold/italic/strikethrough/inline code
+    text = re.sub(r"(\*\*|__)(.*?)\1", r"\2", text)
+    text = re.sub(r"(\*|_|~~|`)(.*?)\1", r"\2", text)
+    # headings, quotes, bullets, numbered lists, hr
+    text = re.sub(r"(?m)^\s{0,3}#{1,6}\s*", "", text)
+    text = re.sub(r"(?m)^\s{0,3}>\s?", "", text)
+    text = re.sub(r"(?m)^\s*([-*+]|\d+[.)])\s+", "", text)
+    text = re.sub(r"(?m)^\s*(-{3,}|_{3,}|\*{3,})\s*$", "", text)
+    return re.sub(r"[ \t]+\n", "\n", text).strip()

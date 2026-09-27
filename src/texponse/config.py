@@ -42,6 +42,7 @@ class Settings(BaseSettings):
     qdrant_port: int = 6333
     qdrant_api_key: str | None = None
     qdrant_collection: str = "knowledge_base"
+    qdrant_use_tls: bool = False
 
     # ── Aircall ──────────────────────────────────────────────────────────
     aircall_api_id: str = ""
@@ -66,9 +67,18 @@ class Settings(BaseSettings):
     openrouter_embedding_model: str = "openai/text-embedding-3-small"
     openrouter_timeout: float = 60.0
 
+    # ── Local embeddings (FastEmbed, no API quota) ─────────────────────
+    embedder_model: str = "BAAI/bge-small-en-v1.5"
+
     # ── Celery ───────────────────────────────────────────────────────────
     celery_broker_url: str | None = None
     celery_result_backend: str | None = None
+
+    # ── Phone-hash pepper (caller isolation) ───────────────────────────
+    # Primary pepper for new hashes. Rotation: set _previous to the old value,
+    # re-sync Jobber data, then clear _previous. Falls back to secret_key if unset.
+    phone_hash_pepper: str = ""
+    phone_hash_pepper_previous: str = ""
 
     # ── Rate Limiting ───────────────────────────────────────────────────
     webhook_rate_limit: str = "60/minute"
@@ -102,7 +112,39 @@ class Settings(BaseSettings):
 
     @property
     def qdrant_url(self) -> str:
-        return f"http://{self.qdrant_host}:{self.qdrant_port}"
+        scheme = "https" if self.qdrant_use_tls else "http"
+        return f"{scheme}://{self.qdrant_host}:{self.qdrant_port}"
+
+    @field_validator("secret_key")
+    @classmethod
+    def _require_prod_secret(cls, value: str) -> str:
+        import os
+
+        is_prod = os.getenv("APP_ENV", "").lower() == "production"
+        if is_prod and (
+            not value or value in {"dev-secret-change-me", "change-this-in-production"}
+        ):
+            raise ValueError("SECRET_KEY must be set to a strong value in production")
+        return value
+
+    def validate_production(self) -> list[str]:
+        """Return list of missing/insecure settings blocking production deploy."""
+        issues: list[str] = []
+        if not self.openrouter_api_key:
+            issues.append("OPENROUTER_API_KEY is empty")
+        if not self.aircall_api_id or not self.aircall_api_token:
+            issues.append("AIRCALL_API_ID / AIRCALL_API_TOKEN are empty")
+        if not self.aircall_webhook_secret:
+            issues.append("AIRCALL_WEBHOOK_SECRET is empty")
+        if not self.aircall_callback_token:
+            issues.append("AIRCALL_CALLBACK_TOKEN is empty (unsigned callbacks accepted)")
+        if not self.jobber_client_id or not self.jobber_client_secret:
+            issues.append("JOBBER client id/secret empty — no customer context")
+        if self.secret_key in {"dev-secret-change-me", "change-this-in-production"}:
+            issues.append("SECRET_KEY is still the dev default")
+        if self.debug or self.app_env.lower() != "production":
+            issues.append("DEBUG should be false and APP_ENV=production in prod")
+        return issues
 
     @property
     def openrouter_headers(self) -> dict[str, str]:

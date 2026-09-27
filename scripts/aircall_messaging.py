@@ -8,6 +8,7 @@ Usage:
 Restoring (DELETE configuration) returns the number to normal Aircall-app
 SMS so it receives messages even when this app is stopped.
 """
+
 from __future__ import annotations
 
 import argparse
