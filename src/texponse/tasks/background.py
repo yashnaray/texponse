@@ -14,7 +14,6 @@ from texponse.db.database import get_async_session
 from texponse.db.repositories import ConversationRepository
 from texponse.integrations.aircall import AircallClient
 from texponse.integrations.jobber import JobberClient
-from texponse.integrations.openrouter import OpenRouterClient
 from texponse.rag.orchestrator import LLMOrchestrator
 from texponse.rag.prompt_builder import PromptBuilder, PromptContext
 from texponse.rag.retriever import Embedder, HybridRetriever, RetrievedPassage
@@ -97,13 +96,9 @@ async def _process_conversation(
     repo = ConversationRepository(session)
 
     aircall = AircallClient(settings)
-    openrouter = OpenRouterClient(
-        api_key=settings.openrouter_api_key,
-        base_url=settings.openrouter_base_url,
-        default_model=settings.openrouter_default_model,
-        fallback_model=settings.openrouter_fallback_model,
-        timeout=settings.openrouter_timeout,
-    )
+    from texponse.integrations.openrouter import build_llm_client
+
+    openrouter = build_llm_client(settings)
     prompt_builder = PromptBuilder(settings, openrouter)
     orchestrator = LLMOrchestrator(settings, openrouter, prompt_builder)
 
@@ -160,9 +155,73 @@ async def _process_conversation(
     _peppers = active_peppers(
         settings.secret_key, settings.phone_hash_pepper, settings.phone_hash_pepper_previous
     )
-    _hashes = sorted({_caller_hash(from_number, pepper=p) for p in _peppers} - {""})
+    # MIGRATION: points indexed before peppering used pepper="". Include the
+    # legacy hash in the query until a Jobber re-sync rewrites all points,
+    # otherwise Qdrant returns 0 hits (what you're seeing in the log).
+    _all_peppers = list(dict.fromkeys(_peppers + [""]))
+    _hashes = sorted({_caller_hash(from_number, pepper=p) for p in _all_peppers} - {""})
     _ch = _hashes[0] if _hashes else ""
-    if _ch:
+    # Dev god mode: hard-gated to development. No filters, no verification.
+    _god_mode = bool(settings.dev_disable_security and settings.app_env == "development")
+    if _god_mode:
+        logger.warning(
+            "DEV GOD MODE: all chunk access security disabled. "
+            "Never enable outside development."
+        )
+    # Dev-only escape hatch: gated to development env, company isolation stays on.
+    _dev_bypass = bool(settings.dev_bypass_chunk_security and settings.app_env == "development")
+    # Dispatcher allowlist: these numbers may look up any client in their OWN
+    # company (e.g. office staff texting from a known line). Company isolation
+    # stays enforced; the caller phone-hash check is skipped for them.
+    _allowlisted = False
+    if settings.chunk_security_bypass_numbers and from_number:
+        _digits = "".join(c for c in from_number if c.isdigit())[-10:]
+        _allowed = {
+            "".join(c for c in n if c.isdigit())[-10:]
+            for n in settings.chunk_security_bypass_numbers.split(",")
+        } - {""}
+        _allowlisted = _digits in _allowed
+    _bypass = _dev_bypass or _allowlisted
+    if _allowlisted:
+        logger.info(
+            "Dispatcher bypass: %s scoped to company=%s (caller check skipped).",
+            _digits,
+            company_id,
+        )
+    if _dev_bypass:
+        logger.warning(
+            "DEV BYPASS active: caller phone-hash check skipped (company=%s). "
+            "Never enable outside development.",
+            company_id,
+        )
+    if _god_mode:
+        _qfilter = None
+    elif _bypass:
+        _qfilter = _qmodels.Filter(
+            should=[
+                _qmodels.Filter(
+                    must=[
+                        _qmodels.FieldCondition(
+                            key="category",
+                            match=_qmodels.MatchValue(value="jobber"),
+                        ),
+                        _qmodels.FieldCondition(
+                            key="company_id",
+                            match=_qmodels.MatchValue(value=company_id),
+                        ),
+                    ]
+                ),
+                _qmodels.Filter(
+                    must_not=[
+                        _qmodels.FieldCondition(
+                            key="category",
+                            match=_qmodels.MatchValue(value="jobber"),
+                        ),
+                    ]
+                ),
+            ]
+        )
+    elif _ch:
         _qfilter = _qmodels.Filter(
             should=[
                 _qmodels.Filter(
@@ -201,16 +260,28 @@ async def _process_conversation(
                 ),
             ]
         )
-    passages = await retriever.retrieve(query=query, filters=_qfilter) if query else []
+    passages = []
+    if query:
+        try:
+            passages = await retriever.retrieve(query=query, filters=_qfilter)
+        except Exception as exc:
+            logger.exception("Qdrant retrieve failed (collection=%s): %s", settings.qdrant_collection, exc)
+        logger.info(
+            "Qdrant retrieve: %d passages for company=%s (caller hash %s)",
+            len(passages),
+            company_id,
+            "present" if _ch else "missing",
+        )
     # Defense-in-depth: Qdrant filter is the primary guard, but never trust it
     # alone — drop any jobber passage that isn't scoped to this caller/company.
-    if passages:
+    # Skipped entirely in dev god mode.
+    if passages and not _god_mode:
         verified: list[RetrievedPassage] = []
         for p in passages:
             meta = p.metadata or {}
             if meta.get("category") == "jobber":
                 phs = set(meta.get("phone_hashes") or [])
-                if not _hashes or phs.isdisjoint(_hashes):
+                if not _bypass and (not _hashes or phs.isdisjoint(_hashes)):
                     logger.warning("Dropping cross-caller jobber passage from %s", p.source)
                     continue
                 if meta.get("company_id", company_id) != company_id:
@@ -261,32 +332,43 @@ async def _process_conversation(
     latency_ms = 0
     was_fallback = False
     passages_count = len(passages)
-    try:
-        response = await orchestrator.generate(
-            query=query,
-            context=prompt_context,
-            company_name="Texponse",
-        )
-        response_model = orchestrator.to_db_model(response, conv.id)
-        await repo.save_response(response_model)
-        response_content = response.content
-        model_used = response.model_used
-        prompt_tokens = response.prompt_tokens
-        completion_tokens = response.completion_tokens
-        total_tokens = response.total_tokens
-        latency_ms = response.latency_ms
-        was_fallback = response.was_fallback
-        passages_count = response.retrieved_passage_count
-    except Exception as exc:
-        # LLM/RAG failure must not leave the customer with silence:
-        # fall back to a static SMS reply (regular-SMS behaviour).
-        logger.exception("LLM generation failed, using static fallback SMS: %s", exc)
+    if await _llm_budget_exhausted(settings):
+        # Daily quota already spent: don't even knock on the provider's door.
+        logger.warning("LLM daily budget spent, serving static SMS without API call")
         response_content = (
             "Thanks for your message — we've received it and our team will follow up shortly."
         )
         model_used = "static-fallback"
         was_fallback = True
-        result_fallback_note = f"llm_error: {exc}"
+        result_fallback_note = "llm_error: daily budget exhausted"
+    else:
+        try:
+            await _llm_spend_tick(settings)
+            response = await orchestrator.generate(
+                query=query,
+                context=prompt_context,
+                company_name="Texponse",
+            )
+            response_model = orchestrator.to_db_model(response, conv.id)
+            await repo.save_response(response_model)
+            response_content = response.content
+            model_used = response.model_used
+            prompt_tokens = response.prompt_tokens
+            completion_tokens = response.completion_tokens
+            total_tokens = response.total_tokens
+            latency_ms = response.latency_ms
+            was_fallback = response.was_fallback
+            passages_count = response.retrieved_passage_count
+        except Exception as exc:
+            # LLM/RAG failure must not leave the customer with silence:
+            # fall back to a static SMS reply (regular-SMS behaviour).
+            logger.exception("LLM generation failed, using static fallback SMS: %s", exc)
+            response_content = (
+                "Thanks for your message — we've received it and our team will follow up shortly."
+            )
+            model_used = "static-fallback"
+            was_fallback = True
+            result_fallback_note = f"llm_error: {exc}"
 
     logger.info(
         "Generated response for conversation %s via %s: %s",
@@ -358,6 +440,50 @@ async def _process_conversation(
     return result
 
 
+async def _llm_budget_key(settings: Any) -> str:
+    from datetime import datetime as _dt
+
+    return f"texponse:llm_spend:{_dt.utcnow().strftime('%Y-%m-%d')}"
+
+
+async def _llm_budget_exhausted(settings: Any) -> bool:
+    """True when today's billable LLM attempts already hit llm_daily_budget.
+
+    Fail-open: if Redis is unreachable we proceed (better a 429 than silence).
+    """
+    budget = int(getattr(settings, "effective_daily_budget", None) or getattr(settings, "llm_daily_budget", 40) or 0)
+    if budget <= 0:
+        return False
+    try:
+        import redis.asyncio as _aioredis
+
+        rc = _aioredis.from_url(settings.redis_url, socket_connect_timeout=3)
+        try:
+            spent = int(await rc.get(await _llm_budget_key(settings)) or 0)
+        finally:
+            await rc.aclose()
+        return spent >= budget
+    except Exception as exc:
+        logger.warning("LLM budget check failed, proceeding anyway: %s", exc)
+        return False
+
+
+async def _llm_spend_tick(settings: Any) -> None:
+    """Count one billable LLM attempt against today's budget (24h expiry)."""
+    try:
+        import redis.asyncio as _aioredis
+
+        rc = _aioredis.from_url(settings.redis_url, socket_connect_timeout=3)
+        try:
+            key = await _llm_budget_key(settings)
+            await rc.incr(key)
+            await rc.expire(key, 24 * 3600)
+        finally:
+            await rc.aclose()
+    except Exception as exc:
+        logger.warning("LLM spend tick failed (non-fatal): %s", exc)
+
+
 async def _get_jobber_token(session: AsyncSession, company_id: str) -> Any:
     from texponse.db.repositories import JobberTokenRepository
 
@@ -412,7 +538,7 @@ async def _refresh_jobber_tokens() -> dict[str, Any]:
     return {"refreshed_tokens": refreshed}
 
 
-@app.task(name="texponse.tasks.sync_jobber_data")
+@app.task(name="texponse.tasks.sync_jobber_data", time_limit=600, soft_time_limit=540)
 def sync_jobber_data_task() -> dict[str, Any]:
     return asyncio.run(_sync_jobber_data())
 
@@ -439,6 +565,29 @@ async def _sync_jobber_data() -> dict[str, Any]:
 
         _embedder = _Embedder(settings.embedder_model)
         ensure_collection(qdrant, settings.qdrant_collection, vector_size=_embedder.dim)
+        # Dev shortcut: skip the expensive Jobber re-sync when Qdrant already
+        # holds sufficient client data. Hard-gated to development; prod always syncs.
+        _min_chunks = settings.dev_skip_sync_min_chunks
+        if settings.app_env == "development" and _min_chunks > 0:
+            try:
+                import asyncio as _count_asyncio
+
+                _count = await _count_asyncio.to_thread(
+                    qdrant.count,
+                    collection_name=settings.qdrant_collection,
+                )
+                _existing = _count.count if _count is not None else 0
+            except Exception as exc:
+                logger.warning("Qdrant count check failed, syncing anyway: %s", exc)
+                _existing = 0
+            if _existing >= _min_chunks:
+                logger.info(
+                    "Skipping Jobber sync in dev: %d points already in %s (>= %d)",
+                    _existing,
+                    settings.qdrant_collection,
+                    _min_chunks,
+                )
+                return {"skipped": True, "existing_chunks": _existing}
         result = await session.exec(select(JobberToken))
         tokens = list(result.all())
         clients_total = chunks_total = 0
@@ -454,6 +603,28 @@ async def _sync_jobber_data() -> dict[str, Any]:
                 return await _embedder.embed_texts(texts)
 
         for token in tokens:
+            # Refresh expired tokens inline — the beat refresh may not have run yet,
+            # and without this every sync after expiry 401s with 0 chunks.
+            from texponse.db.repositories import JobberTokenRepository as _TokenRepo
+
+            _repo = _TokenRepo(session)
+            if await _repo.is_expired(token):
+                try:
+                    resp = await jobber.refresh_token(token.refresh_token)
+                except Exception as exc:
+                    logger.warning("Jobber refresh failed for %s: %s", token.company_id, exc)
+                    continue
+                if "access_token" not in resp:
+                    logger.warning("Jobber refresh missing access_token for %s", token.company_id)
+                    continue
+                token.access_token = resp["access_token"]
+                token.refresh_token = resp.get("refresh_token", token.refresh_token)
+                from datetime import datetime as _dt
+                from datetime import timedelta as _td
+
+                token.expires_at = _dt.utcnow() + _td(seconds=resp.get("expires_in", 3600))
+                await session.commit()
+                logger.info("Refreshed Jobber token for %s", token.company_id)
             try:
                 clients = await jobber.list_all_clients(token.access_token)
             except Exception as exc:
@@ -477,12 +648,24 @@ async def _sync_jobber_data() -> dict[str, Any]:
                 hashes = sorted({_ph(p, pepper=_sync_pepper) for p in phones_list} - {""})
                 jobs = (c.get("jobs") or {}).get("nodes", []) or []
                 jobs_txt = "; ".join(
-                    f"{j.get('title', '')} ({j.get('jobStatus', '')}, ${j.get('total', 0)})"
+                    f"{j.get('title', '')} ({j.get('jobStatus', '')}, ${j.get('total', 0)}, "
+                    f"{j.get('startAt', '?')}->{j.get('endAt', '?')})"
                     for j in jobs
+                )
+                visits = [
+                    v
+                    for j in jobs
+                    for v in ((j.get("visits") or {}).get("nodes", []) or [])
+                ]
+                visits_txt = "; ".join(
+                    f"{v.get('title', '')} ({v.get('visitStatus', '')}, "
+                    f"{v.get('startAt', '?')}->{v.get('endAt', '?')})"
+                    for v in visits
                 )
                 text = _redact(
                     f"Client: {c.get('name', '')}\nCompany: {c.get('companyName', '')}\n"
-                    f"Balance: ${c.get('balance', 0)}\nJobs: {jobs_txt}"
+                    f"Balance: ${c.get('balance', 0)}\nJobs: {jobs_txt}\n"
+                    f"Upcoming visits: {visits_txt or 'none listed'}"
                 )
                 docs.append(
                     (

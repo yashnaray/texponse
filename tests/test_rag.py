@@ -74,6 +74,35 @@ async def test_orchestrator_redacts_pii():
     assert "test@example.com" not in redacted
 
 
+def test_strip_reasoning_sections():
+    from texponse.security.guardrails import strip_reasoning
+
+    vomit = (
+        "Here's a thinking process:\n"
+        "Analyze User Input: The user is asking about scheduling.\n"
+        "Check Context:\n"
+        "The context shows one client record.\n"
+        "There's no scheduling info.\n"
+        "\n"
+        "Hi! I can help you schedule a visit."
+    )
+    out = strip_reasoning(vomit)
+    assert "Analyze User Input" not in out
+    assert "Check Context" not in out
+    assert "thinking process" not in out.lower()
+    assert "Hi! I can help you schedule a visit." in out
+
+
+def test_strip_reasoning_keeps_real_answers():
+    from texponse.security.guardrails import strip_reasoning
+
+    assert strip_reasoning("Check your inbox for the confirmation text.") == (
+        "Check your inbox for the confirmation text."
+    )
+    assert "<think>hmm</think>Your balance is $0." == "<think>hmm</think>Your balance is $0."
+    assert strip_reasoning("<think>hmm</think>Your balance is $0.") == "Your balance is $0."
+
+
 def _make_minimal_settings():
     from texponse.config import Settings
 

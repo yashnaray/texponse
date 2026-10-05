@@ -55,6 +55,7 @@ def create_app() -> FastAPI:
         from texponse.rag.retriever import ensure_collection
 
         qdrant = QdrantClient(url=settings.qdrant_url, api_key=settings.qdrant_api_key)
+        _skip_startup_sync = False
         try:
             from texponse.rag.retriever import Embedder as _LifEmbedder
 
@@ -63,6 +64,18 @@ def create_app() -> FastAPI:
                 settings.qdrant_collection,
                 vector_size=_LifEmbedder(settings.embedder_model).dim,
             )
+            if settings.app_env == "development" and settings.dev_skip_sync_min_chunks > 0:
+                try:
+                    _count = qdrant.count(collection_name=settings.qdrant_collection)
+                    _existing = _count.count if _count is not None else 0
+                    if _existing >= settings.dev_skip_sync_min_chunks:
+                        logger.info(
+                            "Skipping startup Jobber sync in dev: %d points present",
+                            _existing,
+                        )
+                        _skip_startup_sync = True
+                except Exception as exc:
+                    logger.warning("Startup Qdrant count failed, syncing anyway: %s", exc)
         finally:
             try:
                 qdrant.close()
@@ -70,6 +83,8 @@ def create_app() -> FastAPI:
                 logger.warning("Qdrant client close failed: %s", exc)
         # Seed Jobber -> Qdrant on startup so beat's hourly timer doesn't
         # leave the first hour empty. Fire-and-forget to the worker.
+        # Dev shortcut: skip entirely when Qdrant already has sufficient data
+        # (the sync task double-checks this too).
         try:
             from texponse.tasks.background import (
                 refresh_jobber_tokens_task,
@@ -77,7 +92,8 @@ def create_app() -> FastAPI:
             )
 
             refresh_jobber_tokens_task.delay()
-            sync_jobber_data_task.delay()
+            if not _skip_startup_sync:
+                sync_jobber_data_task.delay()
             logger.info("Queued startup Jobber token refresh + data sync")
         except Exception as exc:
             logger.warning("Startup Jobber sync queue failed: %s", exc)
@@ -236,6 +252,16 @@ def create_app() -> FastAPI:
                 direction=normalized.get("direction"),
                 raw_payload=payload,
             )
+            duplicate = await repo.inbound_already_queued(
+                conv.id, event_type, normalized.get("aircall_message_id")
+            )
+            if duplicate:
+                logger.info(
+                    "Skipping duplicate ingest for message %s (%s)",
+                    normalized.get("aircall_message_id"),
+                    event_type_raw,
+                )
+                return
             await repo.add_event(event)
         finally:
             await session.close()

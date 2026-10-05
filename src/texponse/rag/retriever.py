@@ -49,15 +49,21 @@ class Embedder:
         )
 
     async def embed_query(self, text: str) -> list[float]:
+        # NOTE: no BGE instruction prefix here — FastEmbed already handles the
+        # model's expected query formatting, and an explicit prefix measured
+        # strictly worse (dense/sparse top-10 overlap 1/10 -> 0/10).
         embeddings = await self.embed_texts([text])
         return embeddings[0]
 
     @staticmethod
     def build_sparse_vector(text: str) -> SparseVector:
         import hashlib
+        import re as _re
 
-        tokens = text.lower().split()
-        token_set = sorted(set(tokens))
+        # Strip punctuation so "club." and "club" hash identically; drop
+        # empties so stray punctuation doesn't create phantom tokens.
+        tokens = [_re.sub(r"[^a-z0-9]", "", t) for t in text.lower().split()]
+        token_set = sorted({t for t in tokens if t})
         index_to_value: dict[int, float] = {}
         for tok in token_set:
             idx = int(hashlib.md5(tok.encode()).hexdigest(), 16) % 100000
@@ -86,7 +92,16 @@ class HybridRetriever:
         self,
         query: str,
         filters: models.Filter | None = None,
+        min_score: float = 0.0,
     ) -> list[RetrievedPassage]:
+        """Hybrid dense+sparse retrieval with RRF fusion.
+
+        `min_score` optionally floors the fused RRF score (k=60). NOTE: the
+        default is 0.0 (no floor) — measured data shows both legs return
+        relevant-but-different clients on near-duplicate corpora, so a
+        corroboration floor of ~0.02 drops good hits. Only raise this if
+        irrelevant context (not missing context) is the observed failure.
+        """
         import asyncio
 
         dense_vector = await self._embedder.embed_query(query)
@@ -113,7 +128,8 @@ class HybridRetriever:
         )
 
         passages = self._rrf_fusion(dense_response.points, sparse_response.points, k=60)
-        return passages[: self._top_k]
+        relevant = [p for p in passages if p.score >= min_score]
+        return relevant[: self._top_k]
 
     def _rrf_fusion(
         self,

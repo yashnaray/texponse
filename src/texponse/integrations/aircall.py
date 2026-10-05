@@ -80,7 +80,11 @@ class AircallClient:
         line_id: int,
         timeout: float = 30.0,
     ) -> dict[str, Any]:
-        resp = await self._client.get(f"/numbers/{line_id}/messages/configuration", timeout=timeout)
+        resp = await self._client.get(
+            f"/numbers/{line_id}/messages/configuration",
+            headers=self._json_headers,
+            timeout=timeout,
+        )
         resp.raise_for_status()
         data: dict[str, Any] = resp.json()
         return data
@@ -91,10 +95,17 @@ class AircallClient:
         timeout: float = 30.0,
     ) -> dict[str, Any]:
         resp = await self._client.delete(
-            f"/numbers/{line_id}/messages/configuration", timeout=timeout
+            f"/numbers/{line_id}/messages/configuration",
+            headers=self._json_headers,
+            timeout=timeout,
         )
         resp.raise_for_status()
-        data: dict[str, Any] = resp.json()
+        if not resp.content:
+            return {}
+        try:
+            data: dict[str, Any] = resp.json()
+        except ValueError:
+            return {}
         return data
 
     async def get_call(self, call_id: str, timeout: float = 30.0) -> dict[str, Any]:

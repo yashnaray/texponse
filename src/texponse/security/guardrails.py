@@ -130,6 +130,132 @@ def active_peppers(secret_key: str, primary: str = "", previous: str = "") -> li
     return [pep] + ([prev] if prev and prev != pep else [])
 
 
+def strip_reasoning(text: str) -> str:
+    """Remove chain-of-thought / reasoning blocks leaked by reasoning models.
+
+    Handles <think>...</think> (DeepSeek R1, QwQ, Nemotron), <reasoning> tags,
+    and markdown-style reasoning fences. Unclosed tags are treated as running
+    to end-of-text. Never returns empty: falls back to a safe refusal line.
+    """
+    if not text:
+        return text
+    for pattern in (
+        re.compile(r"<think>.*?(</think>|$)", re.IGNORECASE | re.DOTALL),
+        re.compile(r"<reasoning>.*?(</reasoning>|$)", re.IGNORECASE | re.DOTALL),
+        re.compile(r"```(?:think|reasoning)\b.*?```", re.IGNORECASE | re.DOTALL),
+    ):
+        text = pattern.sub("", text)
+    # Conversational thinking-out-loud has no tags ("Here's my thinking
+    # process: ..."). Strip it with plain string matching (no regex).
+    text = text.strip()
+    _openers = (
+        "here's a thinking process",
+        "here is a thinking process",
+        "here's my thinking",
+        "here is my thinking",
+        "here's the thinking",
+        "let me think",
+        "my reasoning is as follows",
+        "the reasoning is as follows",
+        "thinking out loud",
+        "i'll think",
+        "i'll reason",
+    )
+    lowered = text.lower()
+    for opener in _openers:
+        if lowered.startswith(opener):
+            # Drop the opener line itself.
+            newline = text.find("\n")
+            text = "" if newline == -1 else text[newline + 1 :].strip()
+            break
+    # Structured chain-of-thought sections ("Analyze User Input: ...", "Check
+    # Context:", ...). A header is a label line ending in a colon whose first
+    # word is reasoning vocabulary, or a known two-word reasoning label
+    # ("analyze user", "check context") followed by a colon — Nemotron puts
+    # the section body on the same line. Single generic verbs ("Check your
+    # inbox: ...") are NOT headers. Drop leading header blocks (header +
+    # continuation lines) until the first real paragraph.
+    _header_first_words = {
+        "analyze",
+        "analysis",
+        "check",
+        "checking",
+        "consider",
+        "consideration",
+        "constraint",
+        "constraints",
+        "context",
+        "plan",
+        "planning",
+        "reasoning",
+        "think",
+        "thinking",
+        "deliberation",
+        "evaluation",
+        "assessment",
+        "review",
+        "verdict",
+    }
+    _inline_labels = {
+        ("analyze", "user"),
+        ("check", "context"),
+        ("user", "intent"),
+        ("thought", "process"),
+    }
+    _single_nouns = {
+        "reasoning",
+        "analysis",
+        "deliberation",
+        "evaluation",
+        "assessment",
+        "verdict",
+        "constraints",
+        "plan",
+        "planning",
+    }
+
+    def _is_header(line: str) -> bool:
+        stripped = line.strip().lstrip("#*>-•").strip()
+        i = 0
+        while i < len(stripped) and stripped[i] in "0123456789.)":
+            i += 1
+        stripped = stripped[i:].strip().lstrip("*").strip()
+        if ":" not in stripped:
+            return False
+        head, _, rest = stripped.partition(":")
+        words = head.split()
+        if not words:
+            return False
+        first = words[0].lower()
+        if not rest.strip():
+            # Pure label line ("Check Context:").
+            return first in _header_first_words
+        if len(words) >= 2:
+            two = (first, words[1].lower())
+            if two in _inline_labels:
+                return True
+            if first == "step":
+                return words[1].rstrip(".,").isdigit()
+            return False
+        return first in _single_nouns
+
+    lines = text.split("\n")
+    i = 0
+    n = len(lines)
+    while i < n:
+        if not lines[i].strip():
+            i += 1
+            continue
+        if _is_header(lines[i]):
+            i += 1
+            while i < n and lines[i].strip() and not _is_header(lines[i]):
+                i += 1
+            continue
+        break
+    text = "\n".join(lines[i:]).strip()
+    return text or "Thanks for your message — our team will follow up shortly."
+
+
 def to_plaintext(text: str) -> str:
     """Strip markdown/HTML to SMS-safe plain text."""
     text = _SCRIPT_TAG_RE.sub("", text)

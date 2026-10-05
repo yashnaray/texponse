@@ -75,7 +75,7 @@ class LLMOrchestrator:
 
         result = await self._openrouter.chat(
             messages=messages,
-            model=self._settings.openrouter_default_model,
+            model=self._settings.active_default_model,
             max_tokens=self._settings.max_response_tokens,
             temperature=0.7,
         )
@@ -84,6 +84,9 @@ class LLMOrchestrator:
             raise TypeError("Expected non-streaming response from LLM")
 
         content = result.get("content", "")
+        from texponse.security.guardrails import strip_reasoning
+
+        content = strip_reasoning(content)
         content = self._redact_pii(content)
         from texponse.security.guardrails import to_plaintext
 
@@ -93,7 +96,7 @@ class LLMOrchestrator:
 
         return GeneratedResponse(
             content=content,
-            model_used=result.get("model", self._settings.openrouter_default_model),
+            model_used=result.get("model", self._settings.active_default_model),
             prompt_tokens=result.get("prompt_tokens", 0),
             completion_tokens=result.get("completion_tokens", 0),
             total_tokens=result.get("total_tokens", 0),

@@ -70,28 +70,65 @@ class JobberClient:
         query: str,
         variables: dict[str, Any] | None = None,
         access_token: str = "",
+        max_retries: int = 5,
     ) -> dict[str, Any]:
+        import asyncio
+        import logging
+        import random
+
+        logger = logging.getLogger(__name__)
         headers = {
             "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json",
             "X-Jobber-GraphQL-Version": self._graphql_version,
         }
-        resp = await self._client.post(
-            "",
-            json={"query": query, "variables": variables or {}},
-            headers=headers,
-        )
-        resp.raise_for_status()
-        data: dict[str, Any] = resp.json()
+        last_exc: Exception | None = None
+        for attempt in range(max_retries + 1):
+            try:
+                resp = await self._client.post(
+                    "",
+                    json={"query": query, "variables": variables or {}},
+                    headers=headers,
+                )
+                if resp.status_code == 429:
+                    raise JobberAPIError("Throttled", {"status": 429})
+                resp.raise_for_status()
+                data: dict[str, Any] = resp.json()
+            except (httpx.HTTPStatusError, httpx.TransportError, JobberAPIError) as exc:
+                last_exc = exc
+                msg = str(exc)
+                throttled = "429" in msg or "Throttled" in msg or "throttl" in msg.lower()
+                if not throttled or attempt >= max_retries:
+                    raise
+                delay = min(60.0, (2.0**attempt)) + random.uniform(0, 1)
+                logger.warning(
+                    "Jobber throttled (attempt %d/%d), retrying in %.1fs",
+                    attempt + 1,
+                    max_retries,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+                continue
 
-        if "errors" in data:
-            error_msg = data["errors"][0].get("message", "Unknown error")
-            raise JobberAPIError(str(error_msg), data)
+            if "errors" in data:
+                error_msg = data["errors"][0].get("message", "Unknown error")
+                if "throttl" in str(error_msg).lower() and attempt < max_retries:
+                    delay = min(60.0, (2.0**attempt)) + random.uniform(0, 1)
+                    logger.warning(
+                        "Jobber GraphQL throttled (attempt %d/%d), retrying in %.1fs",
+                        attempt + 1,
+                        max_retries,
+                        delay,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                raise JobberAPIError(str(error_msg), data)
 
-        return data
+            return data
+        raise JobberAPIError(f"Jobber request failed after retries: {last_exc}")
 
     async def find_client_by_phone(
-        self, phone_number: str, access_token: str
+        self, phone_number: str, access_token: str, max_retries: int = 2
     ) -> dict[str, Any] | None:
         query = """
         query ListClients($first: Int) {
@@ -106,12 +143,35 @@ class JobberClient:
               email
               balance
               isLead
+              jobs(first: 5) {
+                nodes {
+                  id title jobStatus total startAt endAt
+                  visits(first: 5) {
+                    nodes { id title visitStatus startAt endAt }
+                  }
+                }
+              }
             }
             totalCount
           }
         }
         """
-        result = await self.graphql(query, {"first": 50}, access_token)
+        # Enrichment is best-effort: a throttled Jobber must not hold the SMS
+        # hostage for minutes of backoff. 2 retries (~7s worst case), then
+        # give up and answer from retrieval alone.
+        try:
+            result = await self.graphql(
+                query, {"first": 100}, access_token, max_retries=max_retries
+            )
+        except Exception:
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "Jobber client lookup gave up after %d retries; continuing without "
+                "business context",
+                max_retries,
+            )
+            return None
         data = result.get("data", {})
         nodes: list[dict[str, Any]] = (
             data.get("clients", {}).get("nodes", []) or [] if isinstance(data, dict) else []
@@ -130,7 +190,7 @@ class JobberClient:
                     return c
         return None
 
-    async def list_all_clients(self, access_token: str, limit: int = 200) -> list[dict[str, Any]]:
+    async def list_all_clients(self, access_token: str, limit: int = 1_000) -> list[dict[str, Any]]:
         query = """
         query ListClients($first: Int, $after: String) {
           clients(first: $first, after: $after) {
@@ -145,7 +205,12 @@ class JobberClient:
               balance
               isLead
               jobs(first: 5) {
-                nodes { id title jobStatus total }
+                nodes {
+                  id title jobStatus total startAt endAt
+                  visits(first: 5) {
+                    nodes { id title visitStatus startAt endAt }
+                  }
+                }
               }
             }
             pageInfo { hasNextPage endCursor }
@@ -156,7 +221,7 @@ class JobberClient:
         out: list[dict[str, Any]] = []
         after: str | None = None
         while len(out) < limit:
-            batch = min(50, limit - len(out))
+            batch = min(25, limit - len(out))
             result = await self.graphql(query, {"first": batch, "after": after}, access_token)
             conn = result.get("data", {}).get("clients", {})
             out.extend(conn.get("nodes", []) or [])
@@ -167,6 +232,13 @@ class JobberClient:
             if not new_after or new_after == after:
                 break
             after = new_after
+            import asyncio as _asyncio
+            import random as _random
+
+            # Stay under Jobber's rate limit: 25/page + ~2s pacing.
+            # Smaller pages cost more requests but each is cheaper server-side
+            # and far less likely to trip the throttle window.
+            await _asyncio.sleep(2.0 + _random.uniform(0, 1))
         return out
 
     async def get_client_properties(

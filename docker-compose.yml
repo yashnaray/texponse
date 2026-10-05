@@ -8,6 +8,11 @@ services:
     command: uv run uvicorn texponse.main:app --host 0.0.0.0 --port 8000 --reload
     ports: ["8000:8000"]
     env_file: .env
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     depends_on: [postgres, qdrant, redis]
     volumes: ["./src:/app/src"]
 
@@ -16,8 +21,13 @@ services:
       context: .
       dockerfile: Dockerfile
       target: runtime
-    command: uv run celery -A texponse.tasks.background worker --loglevel=INFO --concurrency=4 --pool=solo
+    command: uv run celery -A texponse.tasks.background worker --loglevel=INFO --concurrency=4 --pool=threads
     env_file: .env
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     depends_on: [postgres, qdrant, redis]
     volumes: ["./src:/app/src"]
 
@@ -28,6 +38,11 @@ services:
       target: runtime
     command: uv run celery -A texponse.tasks.background beat --loglevel=INFO
     env_file: .env
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     depends_on: [postgres, qdrant, redis, worker]
     volumes: ["./src:/app/src"]
 
@@ -61,6 +76,63 @@ services:
     ports: ["6379:6379"]
     command: redis-server --appendonly yes --requirepass texponse_dev
     volumes: [redis_data:/data]
+
+  # ── Local LLM (genuinely free, no quotas, no reasoning) ──────────
+  # Ollama serves an OpenAI-compatible API at http://ollama:11434/v1.
+  # Point OPENROUTER_BASE_URL at it and set LLM_PROVIDER=ollama.
+  # First start pulls the model (~5GB); subsequent starts reuse the volume.
+  ollama:
+    image: ollama/ollama:latest
+    ports: ["11434:11434"]
+    volumes:
+      - ollama_data:/root/.ollama
+    environment:
+      OLLAMA_HOST: 0.0.0.0
+    command: serve
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  ollama-init:
+    image: ollama/ollama:latest
+    depends_on:
+      ollama:
+        condition: service_started
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint: ["/bin/sh", "-c", "sleep 5; ollama pull ${OLLAMA_DEFAULT_MODEL:-llama3.1:8b}"]
+    volumes: []
+
+  # ── Free-LLM proxy router (OpenAI-compatible, auto-failover) ──
+  # Routes across free-tier providers (Groq, Gemini, OpenRouter, Cerebras,
+  # HuggingFace, ...) with cooldowns. Set LLM_PROVIDER=free-proxy in .env
+  # and give it at least one key below (Groq fastest to obtain, no card).
+  free-llm-proxy:
+    build:
+      context: .
+      dockerfile: docker/free-llm-proxy.Dockerfile
+    ports: ["8080:8080"]
+    environment:
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      CEREBRAS_API_KEY: ${CEREBRAS_API_KEY:-}
+      HF_API_KEY: ${HF_API_KEY:-}
+      MISTRAL_API_KEY: ${MISTRAL_API_KEY:-}
+      NVIDIA_API_KEY: ${NVIDIA_API_KEY:-}
+      COHERE_API_KEY: ${COHERE_API_KEY:-}
+      FREE_LLM_SKIP_SCAN: ${FREE_LLM_SKIP_SCAN:-0}
+    volumes:
+      - free_llm_data:/home/appuser/.free-llm-proxy-router
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:8080/v1/models"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
 
   prometheus:
     image: prom/prometheus:v2.53.0
@@ -97,3 +169,5 @@ volumes:
   qdrant_data:
   redis_data:
   grafana_data:
+  ollama_data:
+  free_llm_data:

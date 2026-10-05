@@ -5,7 +5,6 @@ import logging
 import os
 
 from texponse.config import Settings, get_settings
-from texponse.db.database import create_all
 from texponse.rag.retriever import ensure_collection
 
 logger = logging.getLogger("texponse.cli")
@@ -21,7 +20,9 @@ def cli() -> None:
 
 
 async def _index_docs(settings: Settings) -> None:
-    await create_all()
+    # NOTE: no create_all() here — docs indexing only touches Qdrant.
+    # Requiring Postgres (and its DNS) broke `texponse-index` on machines
+    # where POSTGRES_HOST points at a docker-compose service name.
 
     from qdrant_client import QdrantClient
 

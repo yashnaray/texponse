@@ -86,6 +86,25 @@ class ConversationRepository:
         await self._session.refresh(event)
         return event
 
+    async def inbound_already_queued(
+        self,
+        conversation_id: str,
+        event_type: object,
+        aircall_message_id: str | None,
+    ) -> bool:
+        """True if this inbound message was already ingested (webhook+callback double-fire)."""
+        if not aircall_message_id:
+            return False
+        stmt = select(ConversationEvent).where(
+            and_(
+                ConversationEvent.conversation_id == conversation_id,
+                ConversationEvent.event_type == event_type,  # type: ignore[arg-type]
+                ConversationEvent.aircall_message_id == aircall_message_id,
+            )
+        )
+        result = await self._session.exec(stmt)
+        return result.first() is not None
+
     async def get_history(
         self,
         conversation_id: str,
