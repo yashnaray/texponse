@@ -106,6 +106,10 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
+    from texponse.api.kpis import router as kpi_router
+
+    app.include_router(kpi_router)
+
     storage_uri = settings.redis_url
     try:
         import redis as sync_redis

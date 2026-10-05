@@ -6,6 +6,7 @@ from sqlmodel import and_, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from texponse.db.models import (
+    Company,
     Conversation,
     ConversationEvent,
     ConversationStatus,
@@ -13,6 +14,25 @@ from texponse.db.models import (
     Response,
     User,
 )
+
+
+class CompanyRepository:
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def get(self, company_id: str) -> Company | None:
+        return await self._session.get(Company, company_id)
+
+    async def list_active(self) -> list[Company]:
+        stmt = select(Company).where(Company.is_active)
+        result = await self._session.exec(stmt)
+        return list(result.all())
+
+    async def create(self, company: Company) -> Company:
+        self._session.add(company)
+        await self._session.commit()
+        await self._session.refresh(company)
+        return company
 
 
 class UserRepository:

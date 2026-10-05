@@ -27,10 +27,36 @@ class ConversationStatus(StrEnum):
 
 
 class UserRole(StrEnum):
+    # Canonical roles: regular users, superusers (ServicePros employees), devs.
+    USER = "user"
+    SUPERUSER = "superuser"
+    DEV = "dev"
+    # Legacy aliases — kept so existing rows/code keep working.
     ADMIN = "admin"
     AGENT = "agent"
     VIEWER = "viewer"
     SYSTEM = "system"
+
+    @classmethod
+    def _coerce(cls, value: str) -> str:
+        return str(value).lower()
+
+    def is_privileged(self) -> bool:
+        return self._coerce(self.value) in {"superuser", "dev", "admin", "system"}
+
+    def is_dev(self) -> bool:
+        return self._coerce(self.value) in {"dev", "system"}
+
+
+class Company(SQLModel, table=True):
+    __tablename__ = "companies"
+
+    id: str = Field(default_factory=lambda: uuid4().hex, primary_key=True)
+    name: str = Field(index=True)
+    jobber_company_id: str | None = Field(default=None, unique=True, index=True)
+    is_active: bool = Field(default=True)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
 
 
 class ConversationEventStatus(StrEnum):
@@ -47,8 +73,8 @@ class User(SQLModel, table=True):
     email: str = Field(index=True, unique=True)
     name: str
     phone_number: str | None = Field(default=None, index=True)
-    company_id: str = Field(index=True)
-    role: UserRole = Field(default=UserRole.VIEWER)
+    company_id: str | None = Field(default=None, index=True, foreign_key="companies.id")
+    role: UserRole = Field(default=UserRole.USER)
     is_active: bool = Field(default=True)
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
