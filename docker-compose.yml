@@ -77,34 +77,6 @@ services:
     command: redis-server --appendonly yes --requirepass texponse_dev
     volumes: [redis_data:/data]
 
-  # ── Local LLM (genuinely free, no quotas, no reasoning) ──────────
-  # Ollama serves an OpenAI-compatible API at http://ollama:11434/v1.
-  # Point OPENROUTER_BASE_URL at it and set LLM_PROVIDER=ollama.
-  # First start pulls the model (~5GB); subsequent starts reuse the volume.
-  ollama:
-    image: ollama/ollama:latest
-    ports: ["11434:11434"]
-    volumes:
-      - ollama_data:/root/.ollama
-    environment:
-      OLLAMA_HOST: 0.0.0.0
-    command: serve
-    healthcheck:
-      test: ["CMD", "ollama", "list"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-
-  ollama-init:
-    image: ollama/ollama:latest
-    depends_on:
-      ollama:
-        condition: service_started
-    environment:
-      OLLAMA_HOST: http://ollama:11434
-    entrypoint: ["/bin/sh", "-c", "sleep 5; ollama pull ${OLLAMA_DEFAULT_MODEL:-llama3.1:8b}"]
-    volumes: []
-
   # ── Free-LLM proxy router (OpenAI-compatible, auto-failover) ──
   # Routes across free-tier providers (Groq, Gemini, OpenRouter, Cerebras,
   # HuggingFace, ...) with cooldowns. Set LLM_PROVIDER=free-proxy in .env
@@ -169,5 +141,4 @@ volumes:
   qdrant_data:
   redis_data:
   grafana_data:
-  ollama_data:
   free_llm_data:

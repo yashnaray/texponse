@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio as _pacing_asyncio
+import time as _pacing_time
 from typing import Any
 
 import httpx
@@ -10,6 +12,18 @@ class JobberAPIError(Exception):
         super().__init__(message)
         self.message = message
         self.response: dict[str, Any] = response or {}
+
+
+# ── Client-side Jobber pacing ──────────────────────────────────────────
+# Jobber throttles aggressively (~tens of req/min). Serialize GraphQL calls
+# per-process with a minimum gap so concurrent worker threads + the hourly
+# sync don't burst past the limit. Also caches phone lookups (5 min TTL)
+# since the same caller often texts several times in a row.
+_JOBBER_LOCK = _pacing_asyncio.Lock()
+_JOBBER_LAST_CALL: float = 0.0
+_JOBBER_MIN_INTERVAL = 2.0  # seconds between GraphQL calls per process
+_PHONE_CACHE: dict[str, tuple[float, dict[str, Any] | None]] = {}
+_PHONE_CACHE_TTL = 300.0
 
 
 class JobberClient:
@@ -82,14 +96,20 @@ class JobberClient:
             "Content-Type": "application/json",
             "X-Jobber-GraphQL-Version": self._graphql_version,
         }
+        global _JOBBER_LAST_CALL
         last_exc: Exception | None = None
         for attempt in range(max_retries + 1):
             try:
-                resp = await self._client.post(
-                    "",
-                    json={"query": query, "variables": variables or {}},
-                    headers=headers,
-                )
+                async with _JOBBER_LOCK:
+                    gap = _pacing_time.monotonic() - _JOBBER_LAST_CALL
+                    if gap < _JOBBER_MIN_INTERVAL:
+                        await _pacing_asyncio.sleep(_JOBBER_MIN_INTERVAL - gap)
+                    resp = await self._client.post(
+                        "",
+                        json={"query": query, "variables": variables or {}},
+                        headers=headers,
+                    )
+                    _JOBBER_LAST_CALL = _pacing_time.monotonic()
                 if resp.status_code == 429:
                     raise JobberAPIError("Throttled", {"status": 429})
                 resp.raise_for_status()
@@ -100,7 +120,7 @@ class JobberClient:
                 throttled = "429" in msg or "Throttled" in msg or "throttl" in msg.lower()
                 if not throttled or attempt >= max_retries:
                     raise
-                delay = min(60.0, (2.0**attempt)) + random.uniform(0, 1)
+                delay = min(120.0, (5.0 * 2.0**attempt)) + random.uniform(0, 2)
                 logger.warning(
                     "Jobber throttled (attempt %d/%d), retrying in %.1fs",
                     attempt + 1,
@@ -113,7 +133,7 @@ class JobberClient:
             if "errors" in data:
                 error_msg = data["errors"][0].get("message", "Unknown error")
                 if "throttl" in str(error_msg).lower() and attempt < max_retries:
-                    delay = min(60.0, (2.0**attempt)) + random.uniform(0, 1)
+                    delay = min(120.0, (5.0 * 2.0**attempt)) + random.uniform(0, 2)
                     logger.warning(
                         "Jobber GraphQL throttled (attempt %d/%d), retrying in %.1fs",
                         attempt + 1,
@@ -128,28 +148,30 @@ class JobberClient:
         raise JobberAPIError(f"Jobber request failed after retries: {last_exc}")
 
     async def find_client_by_phone(
-        self, phone_number: str, access_token: str, max_retries: int = 2
+        self, phone_number: str, access_token: str, max_retries: int = 1
     ) -> dict[str, Any] | None:
+        import time as _t
+
+        # In-memory TTL cache: repeat texts from the same caller skip Jobber.
+        _digits_key = "".join(c for c in phone_number if c.isdigit())[-10:]
+        cached = _PHONE_CACHE.get((_digits_key, access_token[-8:]))
+        if cached and _t.monotonic() - cached[0] < _PHONE_CACHE_TTL:
+            return cached[1]
+        # Lightweight query: no nested visits, fewer jobs. The old version
+        # pulled jobs+visits for 100 clients per SMS — the main throttle cause.
         query = """
         query ListClients($first: Int) {
           clients(first: $first) {
             nodes {
               id
-              firstName
-              lastName
               name
               companyName
               phones { number primary }
               email
               balance
               isLead
-              jobs(first: 5) {
-                nodes {
-                  id title jobStatus total startAt endAt
-                  visits(first: 5) {
-                    nodes { id title visitStatus startAt endAt }
-                  }
-                }
+              jobs(first: 3) {
+                nodes { id title jobStatus total }
               }
             }
             totalCount
@@ -157,11 +179,10 @@ class JobberClient:
         }
         """
         # Enrichment is best-effort: a throttled Jobber must not hold the SMS
-        # hostage for minutes of backoff. 2 retries (~7s worst case), then
-        # give up and answer from retrieval alone.
+        # hostage. 1 retry, then give up and answer from retrieval alone.
         try:
             result = await self.graphql(
-                query, {"first": 100}, access_token, max_retries=max_retries
+                query, {"first": 25}, access_token, max_retries=max_retries
             )
         except Exception:
             import logging
@@ -182,13 +203,18 @@ class JobberClient:
 
         want = _digits(phone_number)
         # Try exact (last-10-digit) match first, then fall back to first client.
+        found: dict[str, Any] | None = None
         for c in nodes:
             phones = c.get("phones", []) or []
             for p in phones:
                 num = str(p.get("number", ""))
                 if num and _digits(num)[-10:] == want[-10:] and len(want) >= 10:
-                    return c
-        return None
+                    found = c
+                    break
+            if found:
+                break
+        _PHONE_CACHE[(_digits_key, access_token[-8:])] = (_t.monotonic(), found)
+        return found
 
     async def list_all_clients(self, access_token: str, limit: int = 1_000) -> list[dict[str, Any]]:
         query = """
@@ -240,6 +266,82 @@ class JobberClient:
             # and far less likely to trip the throttle window.
             await _asyncio.sleep(2.0 + _random.uniform(0, 1))
         return out
+
+    async def _paginate_root(
+        self, root: str, query: str, access_token: str, limit: int
+    ) -> list[dict[str, Any]]:
+        """Generic cursor paginator for jobs/quotes/invoices roots (50/page)."""
+        import asyncio as _asyncio
+        import random as _random
+
+        out: list[dict[str, Any]] = []
+        after: str | None = None
+        while len(out) < limit:
+            batch = min(50, limit - len(out))
+            result = await self.graphql(
+                query, {"first": batch, "after": after}, access_token
+            )
+            conn = result.get("data", {}).get(root, {}) or {}
+            out.extend(conn.get("nodes", []) or [])
+            page = conn.get("pageInfo", {}) or {}
+            if not page.get("hasNextPage"):
+                break
+            new_after = page.get("endCursor")
+            if not new_after or new_after == after:
+                break
+            after = new_after
+            await _asyncio.sleep(2.0 + _random.uniform(0, 1))
+        return out
+
+    async def list_all_jobs_flat(
+        self, access_token: str, limit: int = 5_000
+    ) -> list[dict[str, Any]]:
+        query = """
+        query KpiJobsFlat($first: Int, $after: String) {
+          jobs(first: $first, after: $after) {
+            nodes {
+              id title jobStatus jobType total invoicedTotal
+              completedAt createdAt startAt endAt source
+              client { id }
+              jobCosting {
+                expenseCost labourCost lineItemCost
+                totalCost totalRevenue profitAmount profitPercentage
+              }
+            }
+            pageInfo { hasNextPage endCursor }
+            totalCount
+          }
+        }
+        """
+        return await self._paginate_root("jobs", query, access_token, limit)
+
+    async def list_all_quotes(
+        self, access_token: str, limit: int = 2_000
+    ) -> list[dict[str, Any]]:
+        query = """
+        query KpiQuotes($first: Int, $after: String) {
+          quotes(first: $first, after: $after) {
+            nodes { id title quoteStatus createdAt amounts { total } }
+            pageInfo { hasNextPage endCursor }
+            totalCount
+          }
+        }
+        """
+        return await self._paginate_root("quotes", query, access_token, limit)
+
+    async def list_all_invoices(
+        self, access_token: str, limit: int = 3_000
+    ) -> list[dict[str, Any]]:
+        query = """
+        query KpiInvoices($first: Int, $after: String) {
+          invoices(first: $first, after: $after) {
+            nodes { id invoiceStatus invoiceNet dueDate createdAt }
+            pageInfo { hasNextPage endCursor }
+            totalCount
+          }
+        }
+        """
+        return await self._paginate_root("invoices", query, access_token, limit)
 
     async def get_client_properties(
         self, client_id: str, access_token: str

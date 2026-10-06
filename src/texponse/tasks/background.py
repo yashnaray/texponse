@@ -290,31 +290,38 @@ async def _process_conversation(
             verified.append(p)
         passages = verified
 
+    # Business context comes from Qdrant point metadata (written by the
+    # hourly Jobber sync) — no live Jobber API call per message, so no
+    # throttling. See _qdrant_client_context below.
     jobber_context: dict[str, Any] | None = None
-    jobber_token = await _get_jobber_token(session, company_id)
-    jobber_client: JobberClient | None = None
-    if jobber_token and from_number:
+    if from_number and _hashes:
         try:
-            jobber_client = JobberClient(
-                client_id=settings.jobber_client_id,
-                client_secret=settings.jobber_client_secret,
-                redirect_uri=settings.jobber_redirect_uri,
-                graphql_version=settings.jobber_graphql_version,
-                base_url=settings.jobber_base_url,
+            jobber_context = await _qdrant_client_context(
+                qdrant, settings.qdrant_collection, company_id, _hashes
             )
-            client_data = await jobber_client.find_client_by_phone(
-                from_number, jobber_token.access_token
-            )
-            if client_data:
-                jobber_context = client_data
         except Exception as exc:
-            logger.warning("Jobber enrichment failed: %s", exc)
-        finally:
-            if jobber_client is not None:
-                try:
-                    await jobber_client.close()
-                except Exception as exc:
-                    logger.warning("Jobber client close failed: %s", exc)
+            logger.warning("Qdrant client-context lookup failed: %s", exc)
+
+    # KPI questions (e.g. "what's our booking rate?") get live numbers.
+    # Gated to staff lines (dispatcher allowlist / dev bypass): revenue and
+    # margin figures must never leak to regular customers who ask.
+    kpi_context: str | None = None
+    if query and (_bypass or _god_mode):
+        from texponse.rag.kpis import detect_kpi_intent
+
+        matched = detect_kpi_intent(query)
+        if matched:
+            try:
+                kpi_context = await _get_cached_kpi_answer(
+                    settings, session, company_id, matched
+                )
+            except Exception as exc:
+                logger.warning("KPI lookup failed, answering without KPIs: %s", exc)
+    elif query:
+        from texponse.rag.kpis import detect_kpi_intent as _detect
+
+        if _detect(query):
+            logger.info("KPI question from non-staff caller; withholding numbers.")
 
     result_fallback_note: str | None = None
 
@@ -324,6 +331,7 @@ async def _process_conversation(
         jobber_context=jobber_context,
         customer_name=jobber_context.get("name") if jobber_context else None,
         customer_phone=from_number,
+        kpi_context=kpi_context,
     )
 
     response_content: str
@@ -489,6 +497,136 @@ async def _get_jobber_token(session: AsyncSession, company_id: str) -> Any:
 
     token_repo = JobberTokenRepository(session)
     return await token_repo.get(company_id)
+
+
+KPI_CACHE_TTL = 3600  # seconds; KPI answers refresh at most hourly per company
+
+
+async def _get_cached_kpi_answer(
+    settings: Any,
+    session: AsyncSession,
+    company_id: str,
+    matched: list[Any],
+) -> str | None:
+    """Return formatted KPI text aggregated from LOCAL data only.
+
+    Reads the structured kpi_job / kpi_quote / kpi_invoice points written by
+    the hourly sync plus Aircall call stats from Postgres — zero Jobber API
+    calls. Results cached in Redis for an hour per company.
+    """
+    import json as _json
+
+    from texponse.rag.kpis import compute_local_kpis
+    from texponse.rag.kpis import format_kpi_answer as _fmt
+
+    keys = sorted(d.key for d in matched)
+    cache_key = f"texponse:kpis:local:{company_id}:{','.join(keys)}"
+    try:
+        import redis.asyncio as _aioredis
+
+        rc = _aioredis.from_url(settings.redis_url, socket_connect_timeout=3)
+        try:
+            hit = await rc.get(cache_key)
+        finally:
+            await rc.aclose()
+        if hit:
+            cached = _json.loads(hit)
+            return _fmt(cached["values"], matched)
+    except Exception as exc:
+        logger.warning("KPI cache read failed, computing live: %s", exc)
+
+    from qdrant_client import QdrantClient as _QC
+
+    from texponse.rag.kpis import load_local_records
+
+    qdrant = _QC(url=settings.qdrant_url, api_key=settings.qdrant_api_key)
+    try:
+        records = await load_local_records(
+            qdrant, session, settings.qdrant_collection, company_id, settings
+        )
+    finally:
+        try:
+            qdrant.close()
+        except Exception as exc:
+            logger.warning("Qdrant client close failed: %s", exc)
+    values = compute_local_kpis(
+        records["jobs"], records["quotes"], records["invoices"], records["calls"],
+        records.get("clients"), records.get("contacts"),
+    )
+    try:
+        import redis.asyncio as _aioredis
+
+        rc = _aioredis.from_url(settings.redis_url, socket_connect_timeout=3)
+        try:
+            await rc.setex(cache_key, KPI_CACHE_TTL, _json.dumps({"values": values}, default=str))
+        finally:
+            await rc.aclose()
+    except Exception as exc:
+        logger.warning("KPI cache write failed (non-fatal): %s", exc)
+    return _fmt(values, matched)
+
+
+async def _qdrant_client_context(
+    qdrant: Any,
+    collection: str,
+    company_id: str,
+    hashes: list[str],
+) -> dict[str, Any] | None:
+    """Fetch one client's business context from Qdrant point metadata.
+
+    Matches points the sync wrote: category=jobber, this company_id, and a
+    phone_hashes overlap with the caller. Returns a dict shaped like the old
+    ``find_client_by_phone`` result so the prompt builder needs no changes.
+    """
+    import asyncio as _aio
+
+    from qdrant_client.http import models as _qm
+
+    filt = _qm.Filter(
+        must=[
+            _qm.FieldCondition(key="category", match=_qm.MatchValue(value="jobber")),
+            _qm.FieldCondition(key="company_id", match=_qm.MatchValue(value=company_id)),
+            _qm.FieldCondition(key="phone_hashes", match=_qm.MatchAny(any=hashes)),
+        ]
+    )
+    points, _ = await _aio.to_thread(
+        qdrant.scroll, collection_name=collection, scroll_filter=filt, limit=1
+    )
+    if not points:
+        return None
+    payload = points[0].payload or {}
+    # Legacy points (written before jobs_snapshot existed) carry everything
+    # in the redacted text field — pass it through as notes so they still
+    # provide context until the next hourly sync rewrites them.
+    if not payload.get("client_name") and payload.get("text"):
+        return {
+            "id": payload.get("document_id", ""),
+            "name": "",
+            "companyName": "",
+            "balance": 0,
+            "isLead": False,
+            "jobs": [],
+            "notes": payload.get("text", ""),
+            "source": payload.get("source_url", ""),
+        }
+    jobs = payload.get("jobs_snapshot", []) or []
+    return {
+        "id": payload.get("client_id", ""),
+        "name": payload.get("client_name", ""),
+        "companyName": payload.get("client_company", ""),
+        "balance": payload.get("balance", 0),
+        "isLead": payload.get("is_lead", False),
+        "jobs": [
+            {
+                "title": j.get("title", ""),
+                "jobStatus": j.get("jobStatus", ""),
+                "total": j.get("total", 0),
+            }
+            for j in jobs
+            if isinstance(j, dict)
+        ],
+        "source": payload.get("source_url", ""),
+    }
 
 
 @app.task(name="texponse.tasks.refresh_jobber_tokens")
@@ -676,6 +814,21 @@ async def _sync_jobber_data() -> dict[str, Any]:
                             "company_id": token.company_id,
                             "phone_hashes": hashes,
                             "phone_hash": hashes[0] if hashes else "",
+                            # Structured business context for per-message
+                            # Qdrant metadata lookup (no Jobber API call).
+                            "client_id": c.get("id", ""),
+                            "client_name": c.get("name", ""),
+                            "client_company": c.get("companyName", ""),
+                            "balance": c.get("balance", 0),
+                            "is_lead": c.get("isLead", False),
+                            "jobs_snapshot": [
+                                {
+                                    "title": j.get("title", ""),
+                                    "jobStatus": j.get("jobStatus", ""),
+                                    "total": j.get("total", 0),
+                                }
+                                for j in jobs[:5]
+                            ],
                         },
                     )
                 )
@@ -711,8 +864,21 @@ async def _sync_jobber_data() -> dict[str, Any]:
                 )
                 chunks_total += len(points)
                 clients_total += len(batch)
-        logger.info("Jobber sync: %d clients, %d chunks", clients_total, chunks_total)
-        return {"synced_clients": clients_total, "chunks": chunks_total}
+
+            # ── KPI objects: flat jobs/quotes/invoices with structured fields.
+            # Stored as kpi_job / kpi_quote / kpi_invoice points so SMS KPI
+            # questions aggregate from Qdrant metadata with zero Jobber calls.
+            try:
+                kpi_counts = await _sync_kpi_objects(
+                    jobber, qdrant, _embedder, _embed_batch,
+                    settings, token, _uuid, _Point, _asyncio,
+                )
+                chunks_total += sum(kpi_counts.values())
+            except Exception as exc:
+                logger.warning("Jobber KPI sync failed for %s: %s", token.company_id, exc)
+                kpi_counts = {}
+        logger.info("Jobber sync: %d clients, %d chunks (%s)", clients_total, chunks_total, kpi_counts)
+        return {"synced_clients": clients_total, "chunks": chunks_total, "kpi": kpi_counts}
     finally:
         await session.close()
         await jobber.close()
@@ -720,6 +886,138 @@ async def _sync_jobber_data() -> dict[str, Any]:
             qdrant.close()
         except Exception as exc:
             logger.warning("Qdrant client close failed: %s", exc)
+
+
+async def _upsert_kpi_points(
+    qdrant: Any,
+    embed_batch: Any,
+    settings: Any,
+    collection_docs: list[tuple[str, str, dict]],
+    uuid_mod: Any,
+    point_cls: Any,
+    aio: Any,
+    embedder_cls: Any,
+) -> int:
+    """Upsert pre-built (doc_id, text, payload) KPI docs in 32-doc batches."""
+    total = 0
+    for i in range(0, len(collection_docs), 32):
+        batch = collection_docs[i : i + 32]
+        vectors = await embed_batch([t for _, t, _ in batch])
+        points = []
+        for (doc_id, text, payload), vec in zip(batch, vectors, strict=True):
+            points.append(
+                point_cls(
+                    id=uuid_mod.uuid5(uuid_mod.NAMESPACE_URL, f"{doc_id}:0").hex,
+                    vector={
+                        "dense": vec,
+                        "bm25": embedder_cls.build_sparse_vector(text),
+                    },
+                    payload=payload,
+                )
+            )
+        await aio.to_thread(
+            qdrant.upsert,
+            collection_name=settings.qdrant_collection,
+            points=points,
+            wait=True,
+        )
+        total += len(points)
+    return total
+
+
+async def _sync_kpi_objects(
+    jobber: Any,
+    qdrant: Any,
+    embedder: Any,
+    embed_batch: Any,
+    settings: Any,
+    token: Any,
+    uuid_mod: Any,
+    point_cls: Any,
+    aio: Any,
+) -> dict[str, int]:
+    """Fetch flat jobs/quotes/invoices and store as structured KPI points."""
+    company_id = token.company_id
+    counts: dict[str, int] = {}
+
+    jobs = await jobber.list_all_jobs_flat(token.access_token)
+    job_docs = [
+        (
+            f"kpi-job-{company_id}-{j.get('id', '')}",
+            f"Job: {j.get('title', '')} ({j.get('jobStatus', '')}, "
+            f"total ${j.get('total', 0)}, invoiced ${j.get('invoicedTotal', 0)})",
+            {
+                "category": "kpi_job",
+                "company_id": company_id,
+                "document_id": f"kpi-job-{company_id}-{j.get('id', '')}",
+                "job_id": j.get("id", ""),
+                "title": j.get("title", ""),
+                "status": str(j.get("jobStatus", "") or "").lower(),
+                "job_type": j.get("jobType", ""),
+                "total": float(j.get("total") or 0),
+                "invoiced_total": float(j.get("invoicedTotal") or 0),
+                "completed_at": j.get("completedAt") or "",
+                "created_at": j.get("createdAt") or j.get("startAt") or "",
+                "source": j.get("source") or "",
+                "jobber_client_id": (j.get("client") or {}).get("id", ""),
+                "costing": j.get("jobCosting") or {},
+            },
+        )
+        for j in jobs
+    ]
+    counts["jobs"] = await _upsert_kpi_points(
+        qdrant, embed_batch, settings, job_docs, uuid_mod, point_cls, aio,
+        type(embedder),
+    )
+
+    quotes = await jobber.list_all_quotes(token.access_token)
+    quote_docs = [
+        (
+            f"kpi-quote-{company_id}-{q.get('id', '')}",
+            f"Quote: {q.get('title', '')} ({q.get('quoteStatus', '')}, "
+            f"total ${(q.get('amounts') or {}).get('total', 0)})",
+            {
+                "category": "kpi_quote",
+                "company_id": company_id,
+                "document_id": f"kpi-quote-{company_id}-{q.get('id', '')}",
+                "quote_id": q.get("id", ""),
+                "title": q.get("title", ""),
+                "status": str(q.get("quoteStatus", "") or "").lower(),
+                "total": float((q.get("amounts") or {}).get("total") or 0),
+                "created_at": q.get("createdAt") or "",
+            },
+        )
+        for q in quotes
+    ]
+    counts["quotes"] = await _upsert_kpi_points(
+        qdrant, embed_batch, settings, quote_docs, uuid_mod, point_cls, aio,
+        type(embedder),
+    )
+
+    invoices = await jobber.list_all_invoices(token.access_token)
+    inv_docs = [
+        (
+            f"kpi-invoice-{company_id}-{v.get('id', '')}",
+            f"Invoice: {v.get('invoiceStatus', '')}, net ${v.get('invoiceNet', 0)}, "
+            f"due {v.get('dueDate', '')}",
+            {
+                "category": "kpi_invoice",
+                "company_id": company_id,
+                "document_id": f"kpi-invoice-{company_id}-{v.get('id', '')}",
+                "invoice_id": v.get("id", ""),
+                "status": str(v.get("invoiceStatus", "") or "").lower(),
+                "net": float(v.get("invoiceNet") or 0),
+                "due_date": v.get("dueDate") or "",
+                "created_at": v.get("createdAt") or "",
+            },
+        )
+        for v in invoices
+    ]
+    counts["invoices"] = await _upsert_kpi_points(
+        qdrant, embed_batch, settings, inv_docs, uuid_mod, point_cls, aio,
+        type(embedder),
+    )
+    return counts
 
 
 @app.task(name="texponse.tasks.health_check")

@@ -21,6 +21,7 @@ class PromptContext:
     jobber_context: dict[str, Any] | None
     customer_name: str | None
     customer_phone: str | None
+    kpi_context: str | None = None
 
 
 SYSTEM_PROMPT = textwrap.dedent("""\
@@ -179,6 +180,11 @@ class PromptBuilder:
         if "instructions" in jobber_data:
             lines.append(f"Job instructions: {jobber_data['instructions']}")
 
+        # Qdrant-metadata lookup shape: legacy points pass the synced client
+        # summary through as notes until the next sync adds structured fields.
+        if client.get("notes"):
+            lines.append(f"Client summary: {client['notes']}")
+
         from texponse.security.guardrails import redact_pii
 
         return redact_pii("\n".join(lines))
@@ -212,6 +218,10 @@ class PromptBuilder:
 
         if jobber_truncated and jobber_truncated != "No business context available.":
             messages.append({"role": "user", "content": jobber_truncated})
+
+        if context.kpi_context:
+            kpi_truncated = self._truncate_to_tokens(context.kpi_context, int(budget * 0.15))
+            messages.append({"role": "user", "content": kpi_truncated})
 
         messages.extend(history_section)
         messages.append({"role": "user", "content": query_full})

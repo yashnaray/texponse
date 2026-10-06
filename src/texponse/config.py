@@ -95,6 +95,13 @@ class Settings(BaseSettings):
     free_proxy_default_model: str = "small"
     free_proxy_fallback_model: str = "speed"
     free_proxy_timeout: float = 120.0
+    groq_api_key: str = ""
+    groq_base_url: str = "https://api.groq.com/openai/v1"
+    # NOTE: qwen/qwen3-32b lists on Groq but 404s at inference time on
+    # this key (decommissioned). gpt-oss-120b/20b verified working 2026-10-05.
+    groq_default_model: str = "openai/gpt-oss-120b"
+    groq_fallback_model: str = "openai/gpt-oss-20b"
+    groq_timeout: float = 60.0
 
     # ── Shared LLM quota protection ────────────────────────────────
     # Min seconds between LLM calls across ALL worker threads (shared lane).
@@ -130,6 +137,8 @@ class Settings(BaseSettings):
             return 18
         if self.llm_provider in ("ollama", "free-proxy"):
             return 10_000  # local/pooled: effectively uncapped
+        if self.llm_provider == "groq":
+            return 2_000  # Groq free tier: generous daily volume, per-minute paced
         return self.llm_daily_budget  # openrouter: 50/day
 
     @property
@@ -140,6 +149,8 @@ class Settings(BaseSettings):
             return self.ollama_default_model
         if self.llm_provider == "free-proxy":
             return self.free_proxy_default_model
+        if self.llm_provider == "groq":
+            return self.groq_default_model
         return self.openrouter_default_model
 
     @property
@@ -150,6 +161,8 @@ class Settings(BaseSettings):
             return self.ollama_fallback_model
         if self.llm_provider == "free-proxy":
             return self.free_proxy_fallback_model
+        if self.llm_provider == "groq":
+            return self.groq_fallback_model
         return self.openrouter_fallback_model
 
     # ── OpenRouter ───────────────────────────────────────────────────────

@@ -175,6 +175,24 @@ MODEL_CONFIGS = {
         max_output_tokens=4096,
         is_free=True,
     ),
+    "qwen/qwen3-32b": ModelConfig(
+        name="qwen/qwen3-32b",
+        context_window=128000,
+        max_output_tokens=4096,
+        is_free=True,
+    ),
+    "openai/gpt-oss-120b": ModelConfig(
+        name="openai/gpt-oss-120b",
+        context_window=131072,
+        max_output_tokens=4096,
+        is_free=True,
+    ),
+    "openai/gpt-oss-20b": ModelConfig(
+        name="openai/gpt-oss-20b",
+        context_window=131072,
+        max_output_tokens=4096,
+        is_free=True,
+    ),
     # Gemini direct models. NOTE: 2.0-flash / 2.5-flash are retired for new
     # users (404 "no longer available"); 3.8-flash + the -latest alias are live.
     "gemini-3.8-flash": ModelConfig(
@@ -606,6 +624,18 @@ def build_llm_client(settings: Any) -> OpenRouterClient:
             fallback_model=settings.free_proxy_fallback_model,
             timeout=settings.free_proxy_timeout,
             local_mode=True,
+        )
+    if provider == "groq":
+        # Groq speaks the OpenAI chat API; per-minute limits are handled by
+        # the shared pacing lane (llm_min_interval).
+        return OpenRouterClient(
+            api_key=settings.groq_api_key,
+            base_url=settings.groq_base_url,
+            default_model=settings.groq_default_model,
+            fallback_model=settings.groq_fallback_model,
+            timeout=settings.groq_timeout,
+            min_interval=min_interval,
+            cooldown_seconds=cooldown,
         )
     return OpenRouterClient(
         api_key=settings.openrouter_api_key,

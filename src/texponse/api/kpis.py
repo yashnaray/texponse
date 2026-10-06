@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from datetime import datetime
-
 from fastapi import APIRouter, HTTPException, Request, status
 
 from texponse.security.rbac import RBACMiddleware
@@ -33,42 +31,56 @@ async def list_kpis(request: Request) -> dict:
 
 
 @router.get("/{company_id}", status_code=200)
-async def company_kpis(request: Request, company_id: str,
-                       start: str | None = None, end: str | None = None) -> dict:
+async def company_kpis(request: Request, company_id: str) -> dict:
+    """KPIs aggregated from local synced data (Qdrant + Postgres).
+
+    Zero Jobber API calls: reads the structured kpi_job / kpi_quote /
+    kpi_invoice points written by the hourly sync. Unavailable KPIs report
+    null ("n/a") instead of fabricated numbers.
+    """
+    from qdrant_client import QdrantClient
+
     from texponse.config import get_settings
     from texponse.db.database import get_async_session
-    from texponse.db.repositories import JobberTokenRepository
-    from texponse.integrations.jobber import JobberClient
-    from texponse.rag.kpis import JobberKPIService
+    from texponse.rag.kpis import (
+        KPI_DEFINITIONS,
+        compute_local_kpis,
+        load_local_records,
+    )
 
     user = await _current_user(request)
     _require_kpi_access(user)
     if not RBACMiddleware.can_access_company(user, company_id):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
 
-    def _parse(v: str | None) -> datetime | None:
-        return datetime.fromisoformat(v) if v else None
-
+    settings = get_settings()
     session = get_async_session()
+    qdrant = QdrantClient(url=settings.qdrant_url, api_key=settings.qdrant_api_key)
+    import contextlib
+
     try:
-        repo = JobberTokenRepository(session)
-        token = await repo.get(company_id)
-        if token is None:
-            raise HTTPException(status_code=404, detail="No Jobber connection for company")
-        settings = get_settings()
-        client = JobberClient(client_id=settings.jobber_client_id,
-                              client_secret=settings.jobber_client_secret,
-                              redirect_uri=settings.jobber_redirect_uri,
-                              graphql_version=settings.jobber_graphql_version,
-                              base_url=settings.jobber_base_url)
-        try:
-            svc = JobberKPIService(client.graphql, token.access_token)
-            result = await svc.get_kpis(_parse(start), _parse(end))
-        finally:
-            await client.close()
+        records = await load_local_records(
+            qdrant, session, settings.qdrant_collection, company_id, settings
+        )
     finally:
+        with contextlib.suppress(Exception):
+            qdrant.close()
         await session.close()
-    return {"company_id": company_id, **result}
+    values = compute_local_kpis(
+        records["jobs"], records["quotes"], records["invoices"], records["calls"],
+        records.get("clients"), records.get("contacts"),
+    )
+    return {
+        "company_id": company_id,
+        "source": "local",
+        "values": values,
+        "definitions": [{**d.__dict__} for d in KPI_DEFINITIONS],
+        "counts": {
+            "jobs": len(records["jobs"]),
+            "quotes": len(records["quotes"]),
+            "invoices": len(records["invoices"]),
+        },
+    }
 
 
 def get_router() -> APIRouter:

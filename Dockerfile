@@ -6,8 +6,8 @@ RUN pip install --no-cache-dir uv==0.12.17
 
 COPY pyproject.toml uv.lock* ./
 
-RUN uv export --frozen --no-hashes -o requirements.txt --all-extras || \
-    uv export --frozen -o requirements.txt || \
+RUN uv export --frozen --no-hashes --no-emit-project -o requirements.txt --all-extras || \
+    uv export --frozen --no-emit-project -o requirements.txt || \
     pip freeze > requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
@@ -19,7 +19,7 @@ ENV PYTHONPATH=/app/src
 
 COPY src/ ./src/
 COPY alembic.ini ./
-COPY src/texponse/db/migrations ./migrations 2>/dev/null || true
+COPY src/texponse/db/migrations ./migrations
 
 RUN useradd --create-home --uid 10001 appuser && chown -R appuser:appuser /app
 USER appuser
