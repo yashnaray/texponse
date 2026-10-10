@@ -426,7 +426,9 @@ async def _process_conversation(
         matched = detect_kpi_intent(query)
         if matched:
             try:
-                kpi_context = await _get_cached_kpi_answer(settings, session, company_id, matched)
+                kpi_context = await _get_cached_kpi_answer(
+                    settings, session, company_id, matched, query
+                )
             except Exception as exc:
                 logger.warning("KPI lookup failed, answering without KPIs: %s", exc)
     elif query:
@@ -603,20 +605,32 @@ async def _get_cached_kpi_answer(
     session: AsyncSession,
     company_id: str,
     matched: list[Any],
+    query: str | None = None,
 ) -> str | None:
     """Return formatted KPI text aggregated from LOCAL data only.
 
     Reads the structured kpi_job / kpi_quote / kpi_invoice points written by
     the hourly sync plus Aircall call stats from Postgres — zero Jobber API
     calls. Results cached in Redis for an hour per company.
+
+    When `query` asks for a time breakdown ("monthly booking rate for
+    2024"), the answer is bucketed per day/week/month/year instead of a
+    single period.
     """
     import json as _json
 
-    from texponse.rag.kpis import compute_local_kpis
+    from texponse.rag.kpis import compute_local_kpis, parse_kpi_window
     from texponse.rag.kpis import format_kpi_answer as _fmt
+    from texponse.rag.kpis import format_kpi_series_answer as _fmt_series
 
     keys = sorted(d.key for d in matched)
-    cache_key = f"texponse:kpis:local:{company_id}:{','.join(keys)}"
+    window = parse_kpi_window(query or "") if query else None
+    window_suffix = (
+        f":{window.start.isoformat()}:{window.end.isoformat()}:{window.granularity}"
+        if window
+        else ":single"
+    )
+    cache_key = f"texponse:kpis:local:{company_id}:{','.join(keys)}{window_suffix}"
     try:
         import redis.asyncio as _aioredis
 
@@ -627,7 +641,10 @@ async def _get_cached_kpi_answer(
             await rc.aclose()
         if hit:
             cached = _json.loads(hit)
-            return _fmt(cached["values"], matched)
+            if window and "series" in cached:
+                return _fmt_series(cached["series"], matched, window.granularity)
+            if not window and "values" in cached:
+                return _fmt(cached["values"], matched)
     except Exception as exc:
         logger.warning("KPI cache read failed, computing live: %s", exc)
 
@@ -640,6 +657,36 @@ async def _get_cached_kpi_answer(
         records = await load_local_records(
             qdrant, session, settings.qdrant_collection, company_id, settings
         )
+        if window:
+            from texponse.rag.kpis import compute_kpi_series, generate_windows, load_call_windows
+
+            windows = generate_windows(window.start, window.end, window.granularity)
+            calls_by_window = await load_call_windows(session, company_id, windows)
+            series = compute_kpi_series(
+                records["jobs"],
+                records["quotes"],
+                records["invoices"],
+                calls_by_window,
+                records.get("clients"),
+                records.get("contacts"),
+                start=window.start,
+                end=window.end,
+                granularity=window.granularity,
+                kpi_keys=keys,
+            )
+            try:
+                import redis.asyncio as _aioredis
+
+                rc = _aioredis.from_url(settings.redis_url, socket_connect_timeout=3)
+                try:
+                    await rc.setex(
+                        cache_key, KPI_CACHE_TTL, _json.dumps({"series": series}, default=str)
+                    )
+                finally:
+                    await rc.aclose()
+            except Exception as exc:
+                logger.warning("KPI cache write failed (non-fatal): %s", exc)
+            return _fmt_series(series, matched, window.granularity)
     finally:
         try:
             qdrant.close()

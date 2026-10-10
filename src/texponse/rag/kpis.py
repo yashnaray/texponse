@@ -8,6 +8,7 @@ testable without API access.
 
 from __future__ import annotations
 
+import re as _re
 from calendar import monthrange as _monthrange
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -299,24 +300,134 @@ def detect_kpi_intent(query: str) -> list[KPIDefinition]:
     return matched
 
 
+@dataclass(frozen=True)
+class KPIWindow:
+    """A parsed natural-language time window: [start, end) + granularity."""
+
+    start: date
+    end: date
+    granularity: str
+
+
+_GRANULARITY_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("day", ("daily", "day by day", "day-by-day", "by day", "per day", "each day")),
+    ("week", ("weekly", "week by week", "week-by-week", "by week", "per week", "each week")),
+    (
+        "month",
+        ("monthly", "month by month", "month-by-month", "by month", "per month", "each month"),
+    ),
+    ("year", ("yearly", "annually", "annual", "year by year", "by year", "per year", "each year")),
+)
+
+
+def detect_granularity(query: str) -> str | None:
+    """Return day/week/month/year when the question asks for a breakdown, else None."""
+    q = query.lower()
+    for gran, phrases in _GRANULARITY_PATTERNS:
+        if any(p in q for p in phrases):
+            return gran
+    return None
+
+
+def parse_kpi_window(query: str, today: date | None = None) -> KPIWindow | None:
+    """Parse a time window + granularity from a natural-language KPI question.
+
+    Returns None when the question has no time-bucketing language (caller
+    keeps the single-period behavior). Supported ranges:
+
+    - explicit year: "booking rate by month for 2024" / "in 2024"
+    - "this/last week|month|year"
+    - "last N days|weeks|months|years" (N <= 3660 buckets)
+    - bare granularity ("monthly booking rate") → trailing window ending
+      today: 30 days / 12 weeks / 12 months / 5 years.
+
+    A granularity phrase is required; a bare "last 30 days" without
+    day/week/month/year wording returns None.
+    """
+    q = query.lower()
+    now = today or date.today()
+    gran = detect_granularity(query)
+
+    m = _re.search(r"\b(19|20)\d{2}\b", q)
+    if m and gran:
+        year = int(m.group(0))
+        return KPIWindow(date(year, 1, 1), date(year + 1, 1, 1), gran)
+
+    m = _re.search(r"\b(this|last)\s+(week|month|year)\b", q)
+    if m and gran:
+        which, unit = m.group(1), m.group(2)
+        if unit == "week":
+            monday = now - timedelta(days=now.weekday())
+            if which == "last":
+                return KPIWindow(monday - timedelta(weeks=1), monday, gran)
+            return KPIWindow(monday, monday + timedelta(weeks=1), gran)
+        if unit == "month":
+            first = now.replace(day=1)
+            if which == "last":
+                return KPIWindow(_add_months(first, -1), first, gran)
+            return KPIWindow(first, _add_months(first, 1), gran)
+        if which == "last":
+            return KPIWindow(date(now.year - 1, 1, 1), date(now.year, 1, 1), gran)
+        return KPIWindow(date(now.year, 1, 1), date(now.year + 1, 1, 1), gran)
+
+    m = _re.search(r"\blast\s+(\d+)\s+(days?|weeks?|months?|years?)\b", q)
+    if m and gran:
+        n = max(int(m.group(1)), 1)
+        unit = m.group(2)
+        if unit.startswith("day"):
+            return KPIWindow(now - timedelta(days=n), now, gran)
+        if unit.startswith("week"):
+            return KPIWindow(now - timedelta(weeks=n), now, gran)
+        if unit.startswith("month"):
+            return KPIWindow(_add_months(now, -n), now, gran)
+        return KPIWindow(date(now.year - n, 1, 1), date(now.year, 1, 1), gran)
+
+    if gran:  # bare granularity → trailing window ending today
+        if gran == "day":
+            return KPIWindow(now - timedelta(days=30), now, gran)
+        if gran == "week":
+            return KPIWindow(now - timedelta(weeks=12), now, gran)
+        if gran == "month":
+            return KPIWindow(_add_months(now, -12), now, gran)
+        return KPIWindow(date(now.year - 5, 1, 1), date(now.year, 1, 1), gran)
+    return None
+
+
+def _format_value(key: str, v: Any) -> str:
+    if v is None:
+        return "n/a"
+    if isinstance(v, dict):
+        parts = ", ".join(f"{k}: {vv if vv is not None else 'n/a'}" for k, vv in v.items())
+        return parts or "n/a"
+    if "rate" in key or "pct" in key or "margin" in key:
+        return f"{v}%"
+    if "revenue" in key or "profit" in key or "ticket" in key:
+        return f"${v:,.2f}" if isinstance(v, float) else f"${v}"
+    if "ratio" in key:
+        return f"{v}x"
+    return str(v)
+
+
 def format_kpi_answer(values: dict[str, Any], defs: list[KPIDefinition]) -> str:
     """Render matched KPI values as SMS-safe plain text for the prompt."""
     lines = ["=== Company KPIs (current period) ==="]
     for d in defs:
-        v = values.get(d.key)
-        if v is None:
-            lines.append(f"{d.name}: n/a")
-        elif isinstance(v, dict):
-            parts = ", ".join(f"{k}: {vv if vv is not None else 'n/a'}" for k, vv in v.items())
-            lines.append(f"{d.name}: {parts or 'n/a'}")
-        elif "rate" in d.key or "pct" in d.key or "margin" in d.key:
-            lines.append(f"{d.name}: {v}%")
-        elif "revenue" in d.key or "profit" in d.key or "ticket" in d.key:
-            lines.append(f"{d.name}: ${v:,.2f}" if isinstance(v, float) else f"{d.name}: ${v}")
-        elif "ratio" in d.key:
-            lines.append(f"{d.name}: {v}x")
-        else:
-            lines.append(f"{d.name}: {v}")
+        lines.append(f"{d.name}: {_format_value(d.key, values.get(d.key))}")
+    return "\n".join(lines)
+
+
+def format_kpi_series_answer(
+    series: list[dict[str, Any]],
+    defs: list[KPIDefinition],
+    granularity: str = "month",
+) -> str:
+    """Render per-bucket KPI values as SMS-safe plain text for the prompt."""
+    lines = [f"=== Company KPIs by {granularity} ==="]
+    for bucket in series:
+        lines.append(f"-- {bucket['label']} --")
+        values = bucket.get("values", {})
+        for d in defs:
+            lines.append(f"{d.name}: {_format_value(d.key, values.get(d.key))}")
     return "\n".join(lines)
 
 
