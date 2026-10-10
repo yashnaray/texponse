@@ -1,0 +1,21 @@
+# Cloudflare Tunnel ingress — routes public hostnames to local services.
+# Tunnel ID + credentials come from `cloudflared tunnel create texponse-prod`
+# which writes <tunnel-id>.json. Mount that dir as /etc/cloudflared.
+tunnel: TUNNEL_ID_PLACEHOLDER
+credentials-file: /etc/cloudflared/TUNNEL_ID_PLACEHOLDER.json
+
+ingress:
+  # Main API + Aircall webhooks
+  - hostname: api.example.com
+    service: http://app:8000
+    originRequest:
+      connectTimeout: 30s
+      tlsTimeout: 10s
+      keepAliveTimeout: 90s
+      # Preserve client IP via CF-Connecting-IP (SlowAPI uses X-Forwarded-For,
+      # so app must trust proxy headers — see note in deploy guide)
+  # Optional: metrics/Grafana behind Cloudflare Access (do NOT expose publicly)
+  - hostname: grafana.example.com
+    service: http://grafana:3000
+  # Catch-all 404
+  - service: http_status:404

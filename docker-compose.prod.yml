@@ -75,6 +75,15 @@ services:
       timeout: 5s
       retries: 5
 
+  # ── Cloudflare Tunnel (edge ingress, no open ports needed) ──
+  # Requires CLOUDFLARE_TUNNEL_TOKEN from Zero Trust dashboard
+  # (or mount ./docker/cloudflared-config.yml + credentials for config-file mode).
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
+    depends_on: [app]
+    restart: unless-stopped
+
 volumes:
   pg_data:
   qdrant_data:

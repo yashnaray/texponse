@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlmodel import and_, select
+from sqlmodel import and_, or_, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from texponse.db.models import (
@@ -12,6 +12,8 @@ from texponse.db.models import (
     ConversationStatus,
     JobberToken,
     Response,
+    SmsConsentStatus,
+    SmsSuppression,
     User,
 )
 
@@ -161,6 +163,60 @@ class ConversationRepository:
         await self._session.commit()
         await self._session.refresh(response)
         return response
+
+
+class SmsSuppressionRepository:
+    """TCPA suppression list keyed by (company_id, peppered phone hash)."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def is_suppressed(self, company_id: str, phone_hashes: list[str]) -> bool:
+        """True if ANY matching hash has an OPTED_OUT row (opt-out wins)."""
+        if not phone_hashes:
+            return False
+        stmt = select(SmsSuppression).where(
+            and_(
+                SmsSuppression.company_id == company_id,
+                or_(*[SmsSuppression.phone_hash == h for h in phone_hashes]),
+                SmsSuppression.status == SmsConsentStatus.OPTED_OUT,
+            )
+        )
+        result = await self._session.exec(stmt)
+        return result.first() is not None
+
+    async def set_status(
+        self,
+        company_id: str,
+        phone_hashes: list[str],
+        status: SmsConsentStatus,
+        keyword: str | None = None,
+    ) -> None:
+        """Upsert one row per hash so pepper rotation keeps matching."""
+        now = datetime.utcnow()
+        for h in phone_hashes:
+            stmt = select(SmsSuppression).where(
+                and_(
+                    SmsSuppression.company_id == company_id,
+                    SmsSuppression.phone_hash == h,
+                )
+            )
+            result = await self._session.exec(stmt)
+            row = result.first()
+            if row:
+                row.status = status
+                row.keyword = keyword
+                row.updated_at = now
+            else:
+                self._session.add(
+                    SmsSuppression(
+                        company_id=company_id,
+                        phone_hash=h,
+                        status=status,
+                        keyword=keyword,
+                    )
+                )
+        await self._session.commit()
 
 
 class JobberTokenRepository:

@@ -127,6 +127,32 @@ class ConversationEvent(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 
 
+class SmsConsentStatus(StrEnum):
+    OPTED_IN = "opted_in"
+    OPTED_OUT = "opted_out"
+
+
+class SmsSuppression(SQLModel, table=True):
+    """TCPA/CTIA suppression list: one row per (company, caller hash).
+
+    A row with status OPTED_OUT blocks ALL outbound SMS to that caller
+    except the one-time opt-out confirmation. OPT_IN rows record
+    re-subscription (START/UNSTOP) and lift the block. Phone numbers are
+    stored as peppered hashes (never raw) to match the caller-isolation
+    scheme; one row is written per active pepper so rotation keeps matching.
+    """
+
+    __tablename__ = "sms_suppressions"
+
+    id: str = Field(default_factory=lambda: uuid4().hex, primary_key=True)
+    company_id: str = Field(index=True)
+    phone_hash: str = Field(index=True)
+    status: SmsConsentStatus = Field(default=SmsConsentStatus.OPTED_OUT, index=True)
+    keyword: str | None = Field(default=None)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+
 class Response(SQLModel, table=True):
     __tablename__ = "responses"
 

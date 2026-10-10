@@ -146,6 +146,119 @@ async def _process_conversation(
 
     query = (content or "").strip()
 
+    # ── TCPA/CTIA SMS compliance ─────────────────────────────────────
+    # Keyword handling + suppression-list enforcement for SMS. Voice calls
+    # are unaffected. Opt-out/HELP/opt-in get deterministic canned replies
+    # (no LLM) so behavior is auditable; suppressed callers get silence.
+    from texponse.db.models import SmsConsentStatus
+    from texponse.db.repositories import CompanyRepository, SmsSuppressionRepository
+    from texponse.security import tcpa as _tcpa
+    from texponse.security.guardrails import active_peppers as _tcpa_peppers
+    from texponse.security.guardrails import phone_hash as _tcpa_hash
+
+    _is_sms = event_type.startswith("message.")
+    _suppression_repo = SmsSuppressionRepository(session)
+    _tcpa_hashes: list[str] = []
+    if _is_sms and from_number:
+        _all_peppers = _tcpa_peppers(
+            settings.secret_key,
+            settings.phone_hash_pepper,
+            settings.phone_hash_pepper_previous,
+        )
+        _tcpa_hashes = sorted({_tcpa_hash(from_number, pepper=p) for p in _all_peppers} - {""})
+
+    async def _tcpa_send(text: str, *, force: bool = False) -> str | None:
+        """Send an SMS honoring the suppression list. Returns delivery_error or None."""
+        if not from_number:
+            return "missing phone numbers"
+        if settings.aircall_line_id is None:
+            return "AIRCALL_LINE_ID is not configured"
+        if (
+            not force
+            and _tcpa_hashes
+            and await _suppression_repo.is_suppressed(company_id, _tcpa_hashes)
+        ):
+            logger.info(
+                "TCPA suppression: skipping send to opted-out caller (company=%s)", company_id
+            )
+            return "suppressed: recipient opted out"
+        try:
+            await aircall.send_message(
+                line_id=settings.aircall_line_id,
+                to_number=from_number,
+                content=text[:1500],
+            )
+        except Exception as exc:
+            import contextlib as _ctx
+
+            detail = str(exc)
+            http_response = getattr(exc, "response", None)
+            if http_response is not None:
+                with _ctx.suppress(Exception):
+                    detail = f"{exc} | body: {http_response.text[:500]}"
+            return detail
+        try:
+            from texponse.db.models import ConversationEvent as _CE
+            from texponse.db.models import ConversationEventType as _CET
+
+            await repo.add_event(
+                _CE(
+                    conversation_id=conv.id,
+                    event_type=_CET.MESSAGE_SENT,
+                    from_number=to_number or None,
+                    to_number=from_number or None,
+                    content=text[:1500],
+                    direction="outbound",
+                    raw_payload={"tcpa": True},
+                )
+            )
+        except Exception as exc:
+            logger.warning("Outbound SMS audit event failed (non-fatal): %s", exc)
+        return None
+
+    async def _tcpa_short_circuit(action: str, reply: str, *, force: bool) -> dict[str, Any]:
+        delivery_error = await _tcpa_send(reply, force=force)
+        res: dict[str, Any] = {
+            "conversation_id": conv.id,
+            "response_preview": reply[:200],
+            "model_used": "tcpa-canned",
+            "tokens": {"prompt": 0, "completion": 0, "total": 0},
+            "latency_ms": 0,
+            "was_fallback": False,
+            "passages_retrieved": 0,
+            "tcpa": action,
+        }
+        if delivery_error is not None:
+            res["delivery_error"] = delivery_error
+        return res
+
+    if _is_sms and from_number and _tcpa_hashes:
+        _company = await CompanyRepository(session).get(company_id)
+        _sender = _company.name if _company and _company.name else "Texponse"
+        _keyword = _tcpa.classify_sms_keyword(content)
+        _raw_keyword = (content or "").strip().split()[0].lower() if (content or "").strip() else ""
+        if _keyword == _tcpa.SmsKeyword.OPT_OUT:
+            await _suppression_repo.set_status(
+                company_id, _tcpa_hashes, SmsConsentStatus.OPTED_OUT, keyword=_raw_keyword
+            )
+            logger.info("TCPA opt-out recorded (company=%s, keyword=%s)", company_id, _raw_keyword)
+            return await _tcpa_short_circuit(
+                "opted_out", _tcpa.opt_out_confirmation(_sender), force=True
+            )
+        if _keyword == _tcpa.SmsKeyword.OPT_IN:
+            await _suppression_repo.set_status(
+                company_id, _tcpa_hashes, SmsConsentStatus.OPTED_IN, keyword=_raw_keyword
+            )
+            logger.info("TCPA opt-in recorded (company=%s, keyword=%s)", company_id, _raw_keyword)
+            return await _tcpa_short_circuit(
+                "opted_in", _tcpa.opt_in_confirmation(_sender), force=True
+            )
+        if _keyword == _tcpa.SmsKeyword.HELP:
+            return await _tcpa_short_circuit("help", _tcpa.help_reply(_sender), force=True)
+        if await _suppression_repo.is_suppressed(company_id, _tcpa_hashes):
+            logger.info("TCPA suppression: ignoring message from opted-out caller")
+            return await _tcpa_short_circuit("suppressed", "", force=False)
+
     from qdrant_client.http import models as _qmodels
 
     from texponse.security.guardrails import active_peppers
@@ -165,8 +278,7 @@ async def _process_conversation(
     _god_mode = bool(settings.dev_disable_security and settings.app_env == "development")
     if _god_mode:
         logger.warning(
-            "DEV GOD MODE: all chunk access security disabled. "
-            "Never enable outside development."
+            "DEV GOD MODE: all chunk access security disabled. Never enable outside development."
         )
     # Dev-only escape hatch: gated to development env, company isolation stays on.
     _dev_bypass = bool(settings.dev_bypass_chunk_security and settings.app_env == "development")
@@ -265,7 +377,9 @@ async def _process_conversation(
         try:
             passages = await retriever.retrieve(query=query, filters=_qfilter)
         except Exception as exc:
-            logger.exception("Qdrant retrieve failed (collection=%s): %s", settings.qdrant_collection, exc)
+            logger.exception(
+                "Qdrant retrieve failed (collection=%s): %s", settings.qdrant_collection, exc
+            )
         logger.info(
             "Qdrant retrieve: %d passages for company=%s (caller hash %s)",
             len(passages),
@@ -312,9 +426,7 @@ async def _process_conversation(
         matched = detect_kpi_intent(query)
         if matched:
             try:
-                kpi_context = await _get_cached_kpi_answer(
-                    settings, session, company_id, matched
-                )
+                kpi_context = await _get_cached_kpi_answer(settings, session, company_id, matched)
             except Exception as exc:
                 logger.warning("KPI lookup failed, answering without KPIs: %s", exc)
     elif query:
@@ -401,32 +513,12 @@ async def _process_conversation(
     if result_fallback_note is not None:
         result["fallback_note"] = result_fallback_note
 
-    if from_number and settings.aircall_line_id is not None:
-        try:
-            await aircall.send_message(
-                line_id=settings.aircall_line_id,
-                to_number=from_number,
-                content=response_content[:1500],
-            )
-        except Exception as exc:
-            import contextlib
-
-            detail = str(exc)
-            http_response = getattr(exc, "response", None)
-            if http_response is not None:
-                with contextlib.suppress(Exception):
-                    detail = f"{exc} | body: {http_response.text[:500]}"
-            logger.warning("Aircall send_message failed: %s", detail)
-            result["delivery_error"] = detail
-    elif not from_number:
-        logger.warning("Skipping Aircall send: missing from_number")
-        result["delivery_error"] = "missing phone numbers"
-    else:
-        logger.warning("Skipping Aircall send: AIRCALL_LINE_ID is not configured")
-        result["delivery_error"] = (
-            "AIRCALL_LINE_ID is not configured; set it to the Aircall number ID "
-            "configured for Public API messaging"
-        )
+    # Suppression re-checked here (race-safe): a STOP arriving mid-LLM
+    # still blocks this send. Audit event recorded on success.
+    delivery_error = await _tcpa_send(response_content)
+    if delivery_error is not None:
+        logger.warning("Aircall send skipped/failed: %s", delivery_error)
+        result["delivery_error"] = delivery_error
 
     try:
         await aircall.close()
@@ -459,7 +551,11 @@ async def _llm_budget_exhausted(settings: Any) -> bool:
 
     Fail-open: if Redis is unreachable we proceed (better a 429 than silence).
     """
-    budget = int(getattr(settings, "effective_daily_budget", None) or getattr(settings, "llm_daily_budget", 40) or 0)
+    budget = int(
+        getattr(settings, "effective_daily_budget", None)
+        or getattr(settings, "llm_daily_budget", 40)
+        or 0
+    )
     if budget <= 0:
         return False
     try:
@@ -550,8 +646,12 @@ async def _get_cached_kpi_answer(
         except Exception as exc:
             logger.warning("Qdrant client close failed: %s", exc)
     values = compute_local_kpis(
-        records["jobs"], records["quotes"], records["invoices"], records["calls"],
-        records.get("clients"), records.get("contacts"),
+        records["jobs"],
+        records["quotes"],
+        records["invoices"],
+        records["calls"],
+        records.get("clients"),
+        records.get("contacts"),
     )
     try:
         import redis.asyncio as _aioredis
@@ -790,11 +890,7 @@ async def _sync_jobber_data() -> dict[str, Any]:
                     f"{j.get('startAt', '?')}->{j.get('endAt', '?')})"
                     for j in jobs
                 )
-                visits = [
-                    v
-                    for j in jobs
-                    for v in ((j.get("visits") or {}).get("nodes", []) or [])
-                ]
+                visits = [v for j in jobs for v in ((j.get("visits") or {}).get("nodes", []) or [])]
                 visits_txt = "; ".join(
                     f"{v.get('title', '')} ({v.get('visitStatus', '')}, "
                     f"{v.get('startAt', '?')}->{v.get('endAt', '?')})"
@@ -870,14 +966,23 @@ async def _sync_jobber_data() -> dict[str, Any]:
             # questions aggregate from Qdrant metadata with zero Jobber calls.
             try:
                 kpi_counts = await _sync_kpi_objects(
-                    jobber, qdrant, _embedder, _embed_batch,
-                    settings, token, _uuid, _Point, _asyncio,
+                    jobber,
+                    qdrant,
+                    _embedder,
+                    _embed_batch,
+                    settings,
+                    token,
+                    _uuid,
+                    _Point,
+                    _asyncio,
                 )
                 chunks_total += sum(kpi_counts.values())
             except Exception as exc:
                 logger.warning("Jobber KPI sync failed for %s: %s", token.company_id, exc)
                 kpi_counts = {}
-        logger.info("Jobber sync: %d clients, %d chunks (%s)", clients_total, chunks_total, kpi_counts)
+        logger.info(
+            "Jobber sync: %d clients, %d chunks (%s)", clients_total, chunks_total, kpi_counts
+        )
         return {"synced_clients": clients_total, "chunks": chunks_total, "kpi": kpi_counts}
     finally:
         await session.close()
@@ -966,7 +1071,13 @@ async def _sync_kpi_objects(
         for j in jobs
     ]
     counts["jobs"] = await _upsert_kpi_points(
-        qdrant, embed_batch, settings, job_docs, uuid_mod, point_cls, aio,
+        qdrant,
+        embed_batch,
+        settings,
+        job_docs,
+        uuid_mod,
+        point_cls,
+        aio,
         type(embedder),
     )
 
@@ -990,7 +1101,13 @@ async def _sync_kpi_objects(
         for q in quotes
     ]
     counts["quotes"] = await _upsert_kpi_points(
-        qdrant, embed_batch, settings, quote_docs, uuid_mod, point_cls, aio,
+        qdrant,
+        embed_batch,
+        settings,
+        quote_docs,
+        uuid_mod,
+        point_cls,
+        aio,
         type(embedder),
     )
 
@@ -1014,7 +1131,13 @@ async def _sync_kpi_objects(
         for v in invoices
     ]
     counts["invoices"] = await _upsert_kpi_points(
-        qdrant, embed_batch, settings, inv_docs, uuid_mod, point_cls, aio,
+        qdrant,
+        embed_batch,
+        settings,
+        inv_docs,
+        uuid_mod,
+        point_cls,
+        aio,
         type(embedder),
     )
     return counts

@@ -57,8 +57,9 @@ def mock_aircall_signature():
 
 @pytest.fixture
 async def async_session():
-    from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+    from sqlalchemy.ext.asyncio import create_async_engine
     from sqlmodel import SQLModel
+    from sqlmodel.ext.asyncio.session import AsyncSession
 
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     async with engine.begin() as conn:
