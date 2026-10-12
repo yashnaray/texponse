@@ -700,6 +700,15 @@ async def _get_cached_kpi_answer(
         records.get("clients"),
         records.get("contacts"),
     )
+    counts = {
+        "jobs": len(records["jobs"]),
+        "quotes": len(records["quotes"]),
+        "invoices": len(records["invoices"]),
+        "contacts": len(records.get("contacts", [])),
+        "inbound_calls": records["calls"].get("total_inbound", 0),
+    }
+    answer = _fmt(values, matched, counts)
+    logger.info("KPI answer context (company=%s):\n%s", company_id, answer)
     try:
         import redis.asyncio as _aioredis
 
@@ -710,7 +719,7 @@ async def _get_cached_kpi_answer(
             await rc.aclose()
     except Exception as exc:
         logger.warning("KPI cache write failed (non-fatal): %s", exc)
-    return _fmt(values, matched)
+    return answer
 
 
 async def _qdrant_client_context(
@@ -847,8 +856,9 @@ async def _sync_jobber_data() -> dict[str, Any]:
     )
     try:
         from texponse.rag.retriever import Embedder as _Embedder
+        from texponse.rag.retriever import get_embedder as _get_embedder
 
-        _embedder = _Embedder(settings.embedder_model)
+        _embedder = _get_embedder(settings.embedder_model)
         ensure_collection(qdrant, settings.qdrant_collection, vector_size=_embedder.dim)
         # Dev shortcut: skip the expensive Jobber re-sync when Qdrant already
         # holds sufficient client data. Hard-gated to development; prod always syncs.
@@ -976,7 +986,7 @@ async def _sync_jobber_data() -> dict[str, Any]:
                     )
                 )
             # Batch embed 32 docs per API call instead of 1 call per doc.
-            for i in range(0, len(docs), 32):
+            for i in range(0, len(docs), 128):
                 batch = docs[i : i + 32]
                 vectors = await _embed_batch([t for _, t, _, _ in batch])
                 points = []
@@ -1052,7 +1062,7 @@ async def _upsert_kpi_points(
 ) -> int:
     """Upsert pre-built (doc_id, text, payload) KPI docs in 32-doc batches."""
     total = 0
-    for i in range(0, len(collection_docs), 32):
+    for i in range(0, len(collection_docs), 128):
         batch = collection_docs[i : i + 32]
         vectors = await embed_batch([t for _, t, _ in batch])
         points = []

@@ -94,6 +94,14 @@ class LLMOrchestrator:
 
         latency_ms = int((time.perf_counter() - start) * 1000)
 
+        logger.info(
+            "LLM reply (model=%s, fallback=%s, kpi=%s): %s",
+            result.get("model", self._settings.active_default_model),
+            result.get("fallback_used", False),
+            bool(context.kpi_context),
+            content[:500],
+        )
+
         return GeneratedResponse(
             content=content,
             model_used=result.get("model", self._settings.active_default_model),

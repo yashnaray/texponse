@@ -57,12 +57,12 @@ def create_app() -> FastAPI:
         qdrant = QdrantClient(url=settings.qdrant_url, api_key=settings.qdrant_api_key)
         _skip_startup_sync = False
         try:
-            from texponse.rag.retriever import Embedder as _LifEmbedder
+            from texponse.rag.retriever import get_embedder as _lif_get
 
             ensure_collection(
                 qdrant,
                 settings.qdrant_collection,
-                vector_size=_LifEmbedder(settings.embedder_model).dim,
+                vector_size=_lif_get(settings.embedder_model).dim,
             )
             if settings.app_env == "development" and settings.dev_skip_sync_min_chunks > 0:
                 try:

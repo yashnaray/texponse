@@ -5,7 +5,7 @@ services:
       context: .
       dockerfile: Dockerfile
       target: runtime
-    command: uv run uvicorn texponse.main:app --host 0.0.0.0 --port 8000 --reload
+    command: uv run uvicorn texponse.main:app --host 0.0.0.0 --port 8000
     ports: ["8000:8000"]
     env_file: .env
     logging:
@@ -21,7 +21,7 @@ services:
       context: .
       dockerfile: Dockerfile
       target: runtime
-    command: uv run celery -A texponse.tasks.background worker --loglevel=INFO --concurrency=4 --pool=threads
+    command: uv run celery -A texponse.tasks.background worker --loglevel=INFO --concurrency=2 --pool=threads
     env_file: .env
     logging:
       driver: json-file
@@ -107,6 +107,7 @@ services:
       start_period: 60s
 
   prometheus:
+    profiles: ["observability"]
     image: prom/prometheus:v2.53.0
     ports: ["9090:9090"]
     volumes:
@@ -119,6 +120,7 @@ services:
       - "--web.enable-lifecycle"
 
   grafana:
+    profiles: ["observability"]
     image: grafana/grafana-enterprise:11.1.0
     ports: ["3000:3000"]
     environment:
@@ -128,6 +130,7 @@ services:
       - grafana_data:/var/lib/grafana
 
   otel-collector:
+    profiles: ["observability"]
     image: otel/opentelemetry-collector-contrib:0.108.0
     command: ["--config=/etc/otel-collector-config.yaml"]
     volumes:

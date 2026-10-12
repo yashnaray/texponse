@@ -37,6 +37,8 @@ class Embedder:
         self._model_name = model
         self._emb = TextEmbedding(model)
 
+    _INSTANCES: dict[str, Any] = {}
+
     @property
     def dim(self) -> int:
         return int(self._emb.embedding_size)
@@ -184,6 +186,13 @@ class HybridRetriever:
             source_map[fid].score = score
 
         return [source_map[fid] for fid, _ in ranked]
+
+
+def get_embedder(model: str = "BAAI/bge-small-en-v1.5") -> Embedder:
+    """Process-wide singleton: avoids reloading the ONNX model per task."""
+    if model not in Embedder._INSTANCES:
+        Embedder._INSTANCES[model] = Embedder(model)
+    return Embedder._INSTANCES[model]
 
     def format_context(self, passages: list[RetrievedPassage]) -> str:
         if not passages:

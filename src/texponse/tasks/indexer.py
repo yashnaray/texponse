@@ -31,9 +31,9 @@ async def _index_docs(settings: Settings) -> None:
         api_key=settings.qdrant_api_key,
     )
     from texponse.rag.embedder import EmbeddingPipeline
-    from texponse.rag.retriever import Embedder
+    from texponse.rag.retriever import get_embedder
 
-    embedder = Embedder(settings.embedder_model)
+    embedder = get_embedder(settings.embedder_model)
     ensure_collection(qdrant, settings.qdrant_collection, vector_size=embedder.dim)
 
     pipeline = EmbeddingPipeline(qdrant, embedder, settings.qdrant_collection)

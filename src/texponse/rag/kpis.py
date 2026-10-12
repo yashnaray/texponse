@@ -408,11 +408,27 @@ def _format_value(key: str, v: Any) -> str:
     return str(v)
 
 
-def format_kpi_answer(values: dict[str, Any], defs: list[KPIDefinition]) -> str:
+def format_kpi_answer(
+    values: dict[str, Any],
+    defs: list[KPIDefinition],
+    counts: dict[str, Any] | None = None,
+) -> str:
     """Render matched KPI values as SMS-safe plain text for the prompt."""
     lines = ["=== Company KPIs (current period) ==="]
     for d in defs:
         lines.append(f"{d.name}: {_format_value(d.key, values.get(d.key))}")
+        lines.append(f"  Formula: {d.formula}")
+    if counts:
+        lines.append(
+            "Inputs: "
+            + ", ".join(f"{k}={v}" for k, v in counts.items())
+        )
+    lines.append(
+        "INSTRUCTION: answer with the final value AND show the arithmetic: "
+        "quote each input number used, then the formula with numbers plugged in "
+        "(e.g. 'Average ticket = $12,400 / 31 jobs = $400.00'). "
+        "Never give a bare number without its inputs."
+    )
     return "\n".join(lines)
 
 
@@ -423,11 +439,22 @@ def format_kpi_series_answer(
 ) -> str:
     """Render per-bucket KPI values as SMS-safe plain text for the prompt."""
     lines = [f"=== Company KPIs by {granularity} ==="]
+    for d in defs:
+        lines.append(f"Formula for {d.name}: {d.formula}")
     for bucket in series:
         lines.append(f"-- {bucket['label']} --")
         values = bucket.get("values", {})
         for d in defs:
             lines.append(f"{d.name}: {_format_value(d.key, values.get(d.key))}")
+        if bucket.get("counts"):
+            lines.append(
+                "  Inputs: " + ", ".join(f"{k}={v}" for k, v in bucket["counts"].items())
+            )
+    lines.append(
+        "INSTRUCTION: answer with each value AND its inputs: for every number, "
+        "quote the input counts and show the formula with numbers plugged in. "
+        "Never give a bare number without its inputs."
+    )
     return "\n".join(lines)
 
 
@@ -792,9 +819,35 @@ async def load_call_windows(
     answered_dates = [_as_date(v) for v in answered_res.all()]
 
     out: dict[str, dict[str, float]] = {}
-    for w, ws, we in zip(windows, starts, ends, strict=True):
-        total = sum(1 for d in inbound_dates if d is not None and ws <= d < we)
-        answered = sum(1 for d in answered_dates if d is not None and ws <= d < we)
+    import bisect as _bisect
+
+    starts_sorted = sorted(starts)
+    # Pre-bucket with binary search: O(N log W) instead of O(N*W).
+    inbound_buckets: dict[str, int] = {}
+    answered_buckets: dict[str, int] = {}
+    labels_by_start = {date.fromisoformat(w["start"]): w["label"] for w in windows}
+    ends_by_label = {w["label"]: date.fromisoformat(w["end"]) for w in windows}
+    for d in inbound_dates:
+        if d is None:
+            continue
+        i = _bisect.bisect_right(starts_sorted, d) - 1
+        if i < 0:
+            continue
+        label = labels_by_start[starts_sorted[i]]
+        if d < ends_by_label[label]:
+            inbound_buckets[label] = inbound_buckets.get(label, 0) + 1
+    for d in answered_dates:
+        if d is None:
+            continue
+        i = _bisect.bisect_right(starts_sorted, d) - 1
+        if i < 0:
+            continue
+        label = labels_by_start[starts_sorted[i]]
+        if d < ends_by_label[label]:
+            answered_buckets[label] = answered_buckets.get(label, 0) + 1
+    for w in windows:
+        total = inbound_buckets.get(w["label"], 0)
+        answered = min(answered_buckets.get(w["label"], 0), total) if total else 0
         out[w["label"]] = {
             "total_inbound": float(total),
             "unanswered": float(max(total - answered, 0)),
@@ -928,25 +981,84 @@ def compute_kpi_series(
     buckets without call stats report call-based KPIs as None.
     """
     windows = generate_windows(start, end, granularity)
+    import bisect as _bisect
+
+    bounds = [(date.fromisoformat(w["start"]), date.fromisoformat(w["end"])) for w in windows]
+    b_starts = [s for s, _ in bounds]
+
+    def _bucket(d: date | None) -> int:
+        if d is None:
+            return -1
+        i = _bisect.bisect_right(b_starts, d) - 1
+        if i < 0 or not (bounds[i][0] <= d < bounds[i][1]):
+            return -1
+        return i
+
+    # Parse each record date once, then single-pass bucket assignment.
+    n = len(windows)
+    b_jobs: list[list[dict[str, Any]]] = [[] for _ in range(n)]
+    for j in jobs:
+        i = _bucket(_record_date(j))
+        if i >= 0:
+            b_jobs[i].append(j)
+    b_quotes: list[list[dict[str, Any]]] = [[] for _ in range(n)]
+    for q in quotes:
+        i = _bucket(_as_date(q.get("created_at")))
+        if i >= 0:
+            b_quotes[i].append(q)
+    b_invoices: list[list[dict[str, Any]]] = [[] for _ in range(n)]
+    for v in invoices:
+        i = _bucket(_as_date(v.get("due_date")) or _as_date(v.get("created_at")))
+        if i >= 0:
+            b_invoices[i].append(v)
+    b_contacts: list[list[dict[str, Any]]] = [[] for _ in range(n)]
+    for c in contacts or []:
+        i = _bucket(_as_date(c.get("first_seen")))
+        if i >= 0:
+            b_contacts[i].append(c)
+
+    # Hoist booking-rate joins: build once, reuse per bucket.
+    _h2c: dict[str, str] = {}
+    for c in clients or []:
+        _cid = str(c.get("client_id", "") or "")
+        for h in c.get("phone_hashes", []) or []:
+            if h and _cid:
+                _h2c[str(h)] = _cid
+    _jobs_by_client: dict[str, list[datetime]] = {}
+    for j in jobs:
+        _jc = str(j.get("jobber_client_id", "") or "")
+        _cr = _parse_dt(j.get("created_at"))
+        if _jc and _cr:
+            _jobs_by_client.setdefault(_jc, []).append(_cr.replace(tzinfo=None))
+
+    def _booking(w_contacts: list[dict[str, Any]]) -> float | None:
+        if not w_contacts:
+            return None
+        booked = total = 0
+        for ct in w_contacts:
+            first = ct.get("first_seen")
+            if not isinstance(first, datetime):
+                continue
+            fnaive = first.replace(tzinfo=None)
+            total += 1
+            cids = {_h2c[h] for h in ct.get("hashes", []) if h in _h2c}
+            for cid in cids:
+                for jd in _jobs_by_client.get(cid, []):
+                    delta = (jd - fnaive).days
+                    if 0 <= delta <= window_days and jd >= datetime(2000, 1, 1):
+                        booked += 1
+                        break
+                else:
+                    continue
+                break
+        return _pct(booked, total)
+
     result: list[dict[str, Any]] = []
-    for w in windows:
-        ws = date.fromisoformat(w["start"])
-        we = date.fromisoformat(w["end"])
-        w_jobs = [j for j in jobs if _in_window(_record_date(j), ws, we)]
-        # Completed-only KPIs should still count jobs completed in-window
-        # even if created earlier: also include jobs whose completed_at is
-        # in-window regardless of created_at.
-        w_quotes = [q for q in quotes if _in_window(_as_date(q.get("created_at")), ws, we)]
-        w_invoices = [
-            v
-            for v in invoices
-            if _in_window(_as_date(v.get("due_date")) or _as_date(v.get("created_at")), ws, we)
-        ]
-        w_contacts = [
-            c for c in (contacts or []) if _in_window(_as_date(c.get("first_seen")), ws, we)
-        ]
+    for idx, w in enumerate(windows):
+        w_jobs, w_quotes = b_jobs[idx], b_quotes[idx]
+        w_invoices, w_contacts = b_invoices[idx], b_contacts[idx]
         calls = (calls_by_window or {}).get(w["label"], {"total_inbound": 0, "unanswered": 0})
-        booking = compute_booking_rate(jobs, clients or [], w_contacts, window_days=window_days)
+        booking = _booking(w_contacts)
         values = compute_local_kpis(
             w_jobs, w_quotes, w_invoices, calls, clients, w_contacts, window_days=window_days
         )
